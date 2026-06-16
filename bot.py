@@ -25,9 +25,8 @@ active_signups = {}
 # --- ⚙️ CONFIGURATION (CHANGE THESE) ---
 # Replace with your squad's 17-digit Steam64 IDs and their names
 TRACKED_PLAYERS = {
-    "76561198000000001": "S1mple",
-    "76561198000000002": "ZywOo",
-    "76561198000000003": "m0NESY",
+    "76561198722789242": "Hanneskills",
+
 }
 
 # Replace with your actual Discord Text Channel ID where stats should post
