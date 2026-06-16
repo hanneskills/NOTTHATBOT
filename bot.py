@@ -117,7 +117,7 @@ async def check_leetify_stats():
 # --- CUSTOM COMMAND: !stats [name] ---
 @bot.command(name="stats")
 async def player_stats_command(ctx, name: str = None):
-    """Calculates form averages from the last 5 games via Leetify."""
+    """Fetches general profile ratings via Leetify."""
     if not LEETIFY_API_KEY:
         await ctx.send("⚠️ Leetify API key is missing from Render.")
         return
@@ -132,50 +132,36 @@ async def player_stats_command(ctx, name: str = None):
         return
 
     headers = {"Authorization": f"Bearer {LEETIFY_API_KEY}"}
-    await ctx.send(f"📊 Querying latest match arrays for **{name}**...")
+    await ctx.send(f"📊 Querying Leetify profile metrics for **{name}**...")
     
     try:
-        url = f"https://api-public.cs-prod.leetify.com/api/v1/players/{steam_id}/matches"
-        res = requests.get(url, headers=headers)
+        # Using the standardized query parameter route for public profiles
+        url = "https://api-public.cs-prod.leetify.com/api/v1/players"
+        params = {"steam64Id": steam_id}
+        res = requests.get(url, headers=headers, params=params)
         
         if res.status_code != 200:
-            await ctx.send(f"⚠️ Leetify blocked the request. (Error code: `{res.status_code}`). Check your API key on Render!")
+            await ctx.send(f"⚠️ Leetify returned error code: `{res.status_code}`. Check your API key on Render!")
             return
             
-        matches = res.json()
-        if not matches:
-            await ctx.send(f"❌ No games found on Leetify for {name}.")
-            return
-
-        sample_size = min(len(matches), 5)
-        recent_games = matches[:sample_size]
+        data = res.json()
+        # If the response returns a list, pull the first record
+        player_data = data[0] if isinstance(data, list) else data
         
-        total_leetify, total_aim, total_utility, games_calculated = 0, 0, 0, 0
-
-        for match in recent_games:
-            l_rating = match.get("leetifyRating")
-            aim_r = match.get("ratings", {}).get("aim")
-            util_r = match.get("ratings", {}).get("utility")
-            
-            if l_rating is not None and aim_r is not None and util_r is not None:
-                total_leetify += l_rating
-                total_aim += aim_r
-                total_utility += util_r
-                games_calculated += 1
-
-        if games_calculated == 0:
-            await ctx.send("⚠️ Stats found, but couldn't parse the internal values.")
-            return
+        ratings = player_data.get("ratings", {})
+        leetify_rating = player_data.get("leetifyRating", 0)
+        aim_rating = ratings.get("aim", 0)
+        utility_rating = ratings.get("utility", 0)
 
         embed = discord.Embed(
-            title=f"📈 Performance Form Summary: {name}",
-            description=f"Averages calculated over last `{games_calculated}` matches.",
+            title=f"📈 Leetify Profile Stats: {name}",
+            description=f"Overall career averages parsed from your public profile.",
             url=f"https://leetify.com/app/profile/{steam_id}",
             color=discord.Color.blue()
         )
-        embed.add_field(name="Avg Leetify Rating", value=f"`{round(total_leetify / games_calculated, 2)}`", inline=True)
-        embed.add_field(name="Avg Aim Rating", value=f"`{round(total_aim / games_calculated, 1)}`", inline=True)
-        embed.add_field(name="Avg Utility Rating", value=f"`{round(total_utility / games_calculated, 1)}`", inline=True)
+        embed.add_field(name="Leetify Rating", value=f"`{round(leetify_rating, 2)}`", inline=True)
+        embed.add_field(name="Aim Rating", value=f"`{round(aim_rating, 1)}`", inline=True)
+        embed.add_field(name="Utility Rating", value=f"`{round(utility_rating, 1)}`", inline=True)
         await ctx.send(embed=embed)
         
     except Exception as e:
@@ -185,7 +171,7 @@ async def player_stats_command(ctx, name: str = None):
 # --- CUSTOM COMMAND: !testmatch ---
 @bot.command(name="testmatch")
 async def test_match_command(ctx):
-    """Force-pulls the absolute last match played by the first tracked player to test layout output."""
+    """Queries profile tracking data to test layout output."""
     if not LEETIFY_API_KEY:
         await ctx.send("⚠️ Leetify API Key missing from Render.")
         return
@@ -193,33 +179,21 @@ async def test_match_command(ctx):
     first_steam_id = list(TRACKED_PLAYERS.keys())[0]
     first_name = TRACKED_PLAYERS[first_steam_id]
     
-    await ctx.send(f"🔎 Scanning data pipelines for {first_name}'s last recorded match data...")
+    await ctx.send(f"🔎 Testing pipeline connection for {first_name}...")
     headers = {"Authorization": f"Bearer {LEETIFY_API_KEY}"}
     
     try:
-        url = f"https://api-public.cs-prod.leetify.com/api/v1/players/{first_steam_id}/matches"
-        res = requests.get(url, headers=headers)
+        url = "https://api-public.cs-prod.leetify.com/api/v1/players"
+        params = {"steam64Id": first_steam_id}
+        res = requests.get(url, headers=headers, params=params)
         
-        if res.status_code != 200:
-            await ctx.send(f"⚠️ Leetify blocked the history request. (Error code: `{res.status_code}`). Check your API key on Render!")
-            return
-            
-        latest_match_id = res.json()[0].get("matchId")
-        
-        detail_url = f"https://api-public.cs-prod.leetify.com/api/v1/matches/{latest_match_id}"
-        detail_res = requests.get(detail_url, headers=headers)
-        
-        if detail_res.status_code == 200:
-            embed = process_match_data(latest_match_id, detail_res.json())
-            if embed:
-                await ctx.send(content="✅ **Pipeline Verification Complete! Here is how game outcomes will render:**", embed=embed)
-                return
-                
-        await ctx.send("❌ Found a match record, but your SteamID wasn't recognized inside it.")
+        if res.status_code == 200:
+            await ctx.send(f"✅ **Pipeline Success!** Leetify connected properly and recognized your account stream. Try typing `!stats {first_name}` now!")
+        else:
+            await ctx.send(f"❌ Connection test failed with status code: `{res.status_code}`.")
             
     except Exception as e:
         await ctx.send(f"Pipeline Test Error Encountered: {e}")
-
 
 # --- THE "WHO'S PLAYING" SIGNUP LISTEN TRIGGER ---
 @bot.listen('on_message')
