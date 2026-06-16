@@ -35,19 +35,25 @@ last_seen_matches = {}
 
 @bot.event
 async def on_ready():
-    print(f'⚡ Bot is online and vibing as {bot.user}')
+    print(f'⚡ Bot is online and aligned with Leetify layout as {bot.user}')
     check_leetify_stats.start()
 
 
 # --- HELPER FUNCTION: PARSE & CONSTRUCT EMBED FROM MATCH DATA ---
-def process_match_data(match_id, match_data):
-    # Unwrap top-level dictionary key if Leetify wraps match details
-    if isinstance(match_data, dict) and "match" in match_data:
-        match_data = match_data["match"]
+def process_match_data(match_data):
+    if not isinstance(match_data, dict):
+        return None
 
-    map_name = match_data.get("mapName", "Unknown Map").title()
-    team_scores = match_data.get('teamScores', {})
-    scoreline = f"{team_scores.get('ct', 0)} - {team_scores.get('t', 0)}"
+    # FIXED: Aligned with map_name from Screenshot_20260617-005301.png
+    map_raw = match_data.get("map_name", "Unknown Map")
+    map_name = map_raw.replace("de_", "").title()
+    match_id = match_data.get("id", "unknown")
+    
+    # FIXED: Extracting team scores based on the array layout in the screenshot
+    team_scores = match_data.get('team_scores', [])
+    scoreline = "0 - 0"
+    if isinstance(team_scores, list) and len(team_scores) >= 2:
+        scoreline = f"{team_scores[0].get('score', 0)} - {team_scores[1].get('score', 0)}"
     
     embed = discord.Embed(
         title=f"🎬 Match Concluded on {map_name}!",
@@ -58,17 +64,22 @@ def process_match_data(match_id, match_data):
     squad_performance = ""
     any_player_found = False
     
-    for player_stats in match_data.get("playerStats", []):
-        p_steam_id = str(player_stats.get("steamId"))
+    # FIXED: Parsing player data using the 'stats' array and 'steam64_id' from the screenshot
+    for player_stats in match_data.get("stats", []):
+        p_steam_id = str(player_stats.get("steam64_id"))
         
         if p_steam_id in TRACKED_PLAYERS:
             any_player_found = True
             p_name = TRACKED_PLAYERS[p_steam_id]
-            ratings = player_stats.get("ratings", {})
+            
+            # Grabbing standard metrics visible in the response body snippet
+            aim_rating = player_stats.get("accuracy", 0) * 100 # Converting fractional accuracy to display cleanly
+            mvps = player_stats.get("mvps", 0)
+            leetify_rating = player_stats.get("proxim", 0) # Using visible rating key metrics
             
             squad_performance += (
-                f"**{p_name}** • K/D: `{player_stats.get('kills', 0)}/{player_stats.get('deaths', 1)}` • ADR: `{round(player_stats.get('adr', 0), 1)}`\n"
-                f"└ *Aim:* `{round(ratings.get('aim', 0), 1)}` | *Util:* `{round(ratings.get('utility', 0), 1)}` | *Leetify:* `{round(player_stats.get('leetifyRating', 0), 2)}`\n\n"
+                f"**{p_name}** • MVPs: `{mvps}` • Aim Accuracy: `{round(aim_rating, 1)}%`\n"
+                f"└ *Leetify Metric Index:* `{round(leetify_rating, 2)}`\n\n"
             )
             
     if not any_player_found:
@@ -88,33 +99,31 @@ async def check_leetify_stats():
     for steam_id, player_name in TRACKED_PLAYERS.items():
         try:
             url = f"https://api-public.cs-prod.leetify.com/v3/profile/matches"
-            params = {"steam64Id": steam_id}
+            # FIXED: query parameter set to steam64_id per screenshot requirements
+            params = {"steam64_id": steam_id}
             response = requests.get(url, headers=headers, params=params)
             if response.status_code != 200: continue
                 
-            data = response.json()
-            # SAFE UNWRAP: Target Leetify's 'list' key data array 
-            matches = data.get("list", []) if isinstance(data, dict) else data
+            matches = response.json()
             if not isinstance(matches, list) or not matches: continue
 
+            # The top element is the latest match record
             latest_match = matches[0]
-            match_id = latest_match.get("matchId")
+            match_id = latest_match.get("id")
 
             if steam_id not in last_seen_matches:
                 last_seen_matches[steam_id] = match_id
                 continue
 
             if match_id != last_seen_matches[steam_id]:
-                detail_url = f"https://api-public.cs-prod.leetify.com/v2/matches/{match_id}"
-                detail_res = requests.get(detail_url, headers=headers)
-                
-                if detail_res.status_code == 200:
-                    embed = process_match_data(match_id, detail_res.json())
-                    if embed:
-                        for guild in bot.guilds:
-                            channel = discord.utils.get(guild.text_channels, name="leetify")
-                            if channel:
-                                await channel.send(embed=embed)
+                # Since the profile history response already contains the full statistics array,
+                # we can parse it directly without needing a secondary v2 API call!
+                embed = process_match_data(latest_match)
+                if embed:
+                    for guild in bot.guilds:
+                        channel = discord.utils.get(guild.text_channels, name="leetify")
+                        if channel:
+                            await channel.send(embed=embed)
                 
                 last_seen_matches[steam_id] = match_id
 
@@ -125,7 +134,7 @@ async def check_leetify_stats():
 # --- CUSTOM COMMAND: !stats [name] ---
 @bot.command(name="stats")
 async def player_stats_command(ctx, name: str = None):
-    """Calculates form averages from the last 5 games via Leetify."""
+    """Calculates form averages from recent games visible in the history array."""
     if not LEETIFY_API_KEY:
         await ctx.send("⚠️ Leetify API key is missing from Render.")
         return
@@ -144,17 +153,14 @@ async def player_stats_command(ctx, name: str = None):
     
     try:
         url = f"https://api-public.cs-prod.leetify.com/v3/profile/matches"
-        params = {"steam64Id": steam_id}
+        params = {"steam64_id": steam_id}
         res = requests.get(url, headers=headers, params=params)
         
         if res.status_code != 200:
             await ctx.send(f"⚠️ Leetify blocked the request. (Error code: `{res.status_code}`).")
             return
             
-        data = res.json()
-        # SAFE UNWRAP: Access the list layer out of the API dictionary safely
-        matches = data.get("list", []) if isinstance(data, dict) else data
-        
+        matches = res.json()
         if not isinstance(matches, list) or not matches:
             await ctx.send(f"❌ No games found on Leetify for {name}.")
             return
@@ -162,21 +168,17 @@ async def player_stats_command(ctx, name: str = None):
         sample_size = min(len(matches), 5)
         recent_games = matches[:sample_size]
         
-        total_leetify, total_aim, total_utility, games_calculated = 0, 0, 0, 0
+        total_accuracy, total_mvps, games_calculated = 0, 0, 0
 
         for match in recent_games:
-            l_rating = match.get("leetifyRating")
-            aim_r = match.get("ratings", {}).get("aim")
-            util_r = match.get("ratings", {}).get("utility")
-            
-            if l_rating is not None and aim_r is not None and util_r is not None:
-                total_leetify += l_rating
-                total_aim += aim_r
-                total_utility += util_r
-                games_calculated += 1
+            for p_stat in match.get("stats", []):
+                if str(p_stat.get("steam64_id")) == steam_id:
+                    total_accuracy += p_stat.get("accuracy", 0)
+                    total_mvps += p_stat.get("mvps", 0)
+                    games_calculated += 1
 
         if games_calculated == 0:
-            await ctx.send("⚠️ Stats found, but couldn't parse individual values.")
+            await ctx.send("⚠️ Stats found, but couldn't isolate your user ID values inside them.")
             return
 
         embed = discord.Embed(
@@ -185,9 +187,8 @@ async def player_stats_command(ctx, name: str = None):
             url=f"https://leetify.com/app/profile/{steam_id}",
             color=discord.Color.blue()
         )
-        embed.add_field(name="Avg Leetify Rating", value=f"`{round(total_leetify / games_calculated, 2)}`", inline=True)
-        embed.add_field(name="Avg Aim Rating", value=f"`{round(total_aim / games_calculated, 1)}`", inline=True)
-        embed.add_field(name="Avg Utility Rating", value=f"`{round(total_utility / games_calculated, 1)}`", inline=True)
+        embed.add_field(name="Avg Accuracy", value=f"`{round((total_accuracy / games_calculated) * 100, 1)}%`", inline=True)
+        embed.add_field(name="Total MVPs (Form Block)", value=f"`{total_mvps}`", inline=True)
         await ctx.send(embed=embed)
         
     except Exception as e:
@@ -197,7 +198,7 @@ async def player_stats_command(ctx, name: str = None):
 # --- CUSTOM COMMAND: !testmatch ---
 @bot.command(name="testmatch")
 async def test_match_command(ctx):
-    """Force-pulls the absolute last match played by the first tracked player to test layout output."""
+    """Force-pulls the absolute last match from the history payload to verify layout output."""
     if not LEETIFY_API_KEY:
         await ctx.send("⚠️ Leetify API Key missing from Render.")
         return
@@ -210,33 +211,27 @@ async def test_match_command(ctx):
     
     try:
         url = f"https://api-public.cs-prod.leetify.com/v3/profile/matches"
-        params = {"steam64Id": first_steam_id}
+        params = {"steam64_id": first_steam_id}
         res = requests.get(url, headers=headers, params=params)
         
         if res.status_code != 200:
             await ctx.send(f"⚠️ Leetify blocked the history request. (Error code: `{res.status_code}`).")
             return
             
-        data = res.json()
-        # SAFE UNWRAP: Targets the 'list' array index to prevent internal key errors
-        matches = data.get("list", []) if isinstance(data, dict) else data
-        
+        matches = res.json()
         if not isinstance(matches, list) or not matches:
-            await ctx.send("❌ No match records found inside the payload structure.")
+            await ctx.send("❌ No match records found inside the payload list structure.")
             return
             
-        latest_match_id = matches[0].get("matchId")
+        # Select the top match structure seen in the screenshot response body
+        latest_match_payload = matches[0]
         
-        detail_url = f"https://api-public.cs-prod.leetify.com/v2/matches/{latest_match_id}"
-        detail_res = requests.get(detail_url, headers=headers)
-        
-        if detail_res.status_code == 200:
-            embed = process_match_data(latest_match_id, detail_res.json())
-            if embed:
-                await ctx.send(content="✅ **Pipeline Verification Complete! Here is how game outcomes will render:**", embed=embed)
-                return
+        embed = process_match_data(latest_match_payload)
+        if embed:
+            await ctx.send(content="✅ **Pipeline Verification Complete! Here is how your data renders:**", embed=embed)
+            return
                 
-        await ctx.send("❌ Found a match record, but your SteamID wasn't recognized inside it.")
+        await ctx.send("❌ Found a match record, but player metrics formatting mismatch occurred.")
             
     except Exception as e:
         await ctx.send(f"Pipeline Test Error Encountered: {e}")
