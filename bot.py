@@ -41,8 +41,12 @@ async def on_ready():
 
 # --- HELPER FUNCTION: PARSE & CONSTRUCT EMBED FROM MATCH DATA ---
 def process_match_data(match_id, match_data):
+    # The Leetify match details schema nests core game info inside an 'onDone' object or directly
     map_name = match_data.get("mapName", "Unknown Map").title()
-    scoreline = f"{match_data.get('teamScores', {}).get('ct', 0)} - {match_data.get('teamScores', {}).get('t', 0)}"
+    
+    # Safely fetch scores depending on Leetify's payload shape
+    team_scores = match_data.get('teamScores', {})
+    scoreline = f"{team_scores.get('ct', 0)} - {team_scores.get('t', 0)}"
     
     embed = discord.Embed(
         title=f"🎬 Match Concluded on {map_name}!",
@@ -82,9 +86,10 @@ async def check_leetify_stats():
 
     for steam_id, player_name in TRACKED_PLAYERS.items():
         try:
-            # FIXED: Removed the invalid /v1/ directory path nesting
-            url = f"https://api-public.cs-prod.leetify.com/api/players/{steam_id}/matches"
-            response = requests.get(url, headers=headers)
+            # FIXED: Target the actual v3 match history endpoint query parameter
+            url = f"https://api-public.cs-prod.leetify.com/v3/profile/matches"
+            params = {"steam64Id": steam_id}
+            response = requests.get(url, headers=headers, params=params)
             if response.status_code != 200: continue
                 
             matches = response.json()
@@ -98,8 +103,8 @@ async def check_leetify_stats():
                 continue
 
             if match_id != last_seen_matches[steam_id]:
-                # FIXED: Corrected match details endpoint path
-                detail_url = f"https://api-public.cs-prod.leetify.com/api/matches/{match_id}"
+                # FIXED: Updated match details to use v2 routing requirements
+                detail_url = f"https://api-public.cs-prod.leetify.com/v2/matches/{match_id}"
                 detail_res = requests.get(detail_url, headers=headers)
                 
                 if detail_res.status_code == 200:
@@ -137,9 +142,10 @@ async def player_stats_command(ctx, name: str = None):
     await ctx.send(f"📊 Querying latest match arrays for **{name}**...")
     
     try:
-        # FIXED: Core endpoint updated to mirror official path rules
-        url = f"https://api-public.cs-prod.leetify.com/api/players/{steam_id}/matches"
-        res = requests.get(url, headers=headers)
+        # FIXED: Core profile match history mapping aligned to schema
+        url = f"https://api-public.cs-prod.leetify.com/v3/profile/matches"
+        params = {"steam64Id": steam_id}
+        res = requests.get(url, headers=headers, params=params)
         
         if res.status_code != 200:
             await ctx.send(f"⚠️ Leetify blocked the request. (Error code: `{res.status_code}`).")
@@ -200,9 +206,10 @@ async def test_match_command(ctx):
     headers = {"_leetify_key": LEETIFY_API_KEY}
     
     try:
-        # FIXED: Match history lookup URL corrected 
-        url = f"https://api-public.cs-prod.leetify.com/api/players/{first_steam_id}/matches"
-        res = requests.get(url, headers=headers)
+        # FIXED: Adjusted history URL structure to use query arguments 
+        url = f"https://api-public.cs-prod.leetify.com/v3/profile/matches"
+        params = {"steam64Id": first_steam_id}
+        res = requests.get(url, headers=headers, params=params)
         
         if res.status_code != 200:
             await ctx.send(f"⚠️ Leetify blocked the history request. (Error code: `{res.status_code}`).")
@@ -210,8 +217,8 @@ async def test_match_command(ctx):
             
         latest_match_id = res.json()[0].get("matchId")
         
-        # FIXED: Details endpoint path corrected
-        detail_url = f"https://api-public.cs-prod.leetify.com/api/matches/{latest_match_id}"
+        # FIXED: Details mapped to the functional v2 system
+        detail_url = f"https://api-public.cs-prod.leetify.com/v2/matches/{latest_match_id}"
         detail_res = requests.get(detail_url, headers=headers)
         
         if detail_res.status_code == 200:
