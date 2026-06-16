@@ -123,7 +123,7 @@ async def player_stats_command(ctx, name: str = None):
         return
         
     if not name:
-        await ctx.send(f"Provide a name. Example: `!stats Hanneskills`")
+        await ctx.send("Provide a name. Example: `!stats Hanneskills`")
         return
 
     steam_id = next((sid for sid, p_name in TRACKED_PLAYERS.items() if p_name.lower() == name.lower()), None)
@@ -139,7 +139,6 @@ async def player_stats_command(ctx, name: str = None):
         res = requests.get(url, headers=headers)
         
         if res.status_code != 200:
-            print(f"[STATS CMD ERROR] Status code from Leetify: {res.status_code}")
             await ctx.send(f"⚠️ Leetify blocked the request. (Error code: `{res.status_code}`). Check your API key on Render!")
             return
             
@@ -165,7 +164,7 @@ async def player_stats_command(ctx, name: str = None):
                 games_calculated += 1
 
         if games_calculated == 0:
-            await ctx.send(f"⚠️ Stats found, but couldn't parse the internal values.")
+            await ctx.send("⚠️ Stats found, but couldn't parse the internal values.")
             return
 
         embed = discord.Embed(
@@ -202,7 +201,6 @@ async def test_match_command(ctx):
         res = requests.get(url, headers=headers)
         
         if res.status_code != 200:
-            print(f"[TESTMATCH CMD ERROR] Status code from Leetify: {res.status_code}")
             await ctx.send(f"⚠️ Leetify blocked the history request. (Error code: `{res.status_code}`). Check your API key on Render!")
             return
             
@@ -221,3 +219,56 @@ async def test_match_command(ctx):
             
     except Exception as e:
         await ctx.send(f"Pipeline Test Error Encountered: {e}")
+
+
+# --- THE "WHO'S PLAYING" SIGNUP LISTEN TRIGGER ---
+@bot.listen('on_message')
+async def handle_game_signups(message):
+    if message.author == bot.user: return
+    content = message.content.lower()
+    if "game" in content or "playing" in content:
+        embed = discord.Embed(title="🎮 Who's playing tonight?", description="Click the **✅** reaction below to join the squad!", color=discord.Color.blurple())
+        embed.add_field(name="Players Joined:", value="*No one yet...*", inline=False)
+        signup_message = await message.channel.send(embed=embed)
+        await signup_message.add_reaction("✅")
+        active_signups[signup_message.id] = set()
+
+@bot.event
+async def on_reaction_add(reaction, user):
+    if user == bot.user: return
+    if reaction.message.id in active_signups and str(reaction.emoji) == "✅":
+        player_ids = active_signups[reaction.message.id]
+        if user.id not in player_ids:
+            player_ids.add(user.id)
+            await update_signup_embed(reaction.message, player_ids)
+
+@bot.event
+async def on_reaction_remove(reaction, user):
+    if user == bot.user: return
+    if reaction.message.id in active_signups and str(reaction.emoji) == "✅":
+        player_ids = active_signups[reaction.message.id]
+        if user.id in player_ids:
+            player_ids.remove(user.id)
+            await update_signup_embed(reaction.message, player_ids)
+
+async def update_signup_embed(message, player_ids):
+    embed = message.embeds[0]
+    player_mentions = "\n".join([f"• <@{user_id}>" for user_id in player_ids]) if player_ids else "*No one yet...*"
+    embed.set_field_at(0, name="Players Joined:", value=player_mentions, inline=False)
+    await message.edit(embed=embed)
+
+
+# --- AUTO GAMER ROLE FOR VOICE CHAT ---
+@bot.event
+async def on_voice_state_update(member, before, after):
+    guild = member.guild
+    gamer_role = discord.utils.get(guild.roles, name=ROLE_NAME)
+    if not gamer_role: return
+    if before.channel is None and after.channel is not None:
+        await member.add_roles(gamer_role)
+    elif before.channel is not None and after.channel is None:
+        await member.remove_roles(gamer_role)
+
+keep_alive()
+TOKEN = os.environ.get('DISCORD_TOKEN', 'YOUR_BOT_TOKEN')
+bot.run(TOKEN)
