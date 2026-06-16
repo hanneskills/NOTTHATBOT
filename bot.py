@@ -79,9 +79,13 @@ async def on_voice_state_update(member, before, after):
     guild = member.guild
     gamer_role = discord.utils.get(guild.roles, name=ROLE_NAME)
     if not gamer_role: return
+    
+    # ➕ If they weren't in a VC before, but are now -> Give role
     if before.channel is None and after.channel is not None:
         await member.add_roles(gamer_role)
-    elif before.channel_is_not_None and after.channel is None:
+        
+    # ➖ If they WERE in a VC before, but aren't now -> Remove role
+    elif before.channel is not None and after.channel is None:
         await member.remove_roles(gamer_role)
 
 # Start the web server right before the bot runs
