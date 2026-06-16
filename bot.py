@@ -41,10 +41,11 @@ async def on_ready():
 
 # --- HELPER FUNCTION: PARSE & CONSTRUCT EMBED FROM MATCH DATA ---
 def process_match_data(match_id, match_data):
-    # The Leetify match details schema nests core game info inside an 'onDone' object or directly
+    # Unwrap top-level dictionary key if Leetify wraps match details
+    if isinstance(match_data, dict) and "match" in match_data:
+        match_data = match_data["match"]
+
     map_name = match_data.get("mapName", "Unknown Map").title()
-    
-    # Safely fetch scores depending on Leetify's payload shape
     team_scores = match_data.get('teamScores', {})
     scoreline = f"{team_scores.get('ct', 0)} - {team_scores.get('t', 0)}"
     
@@ -86,14 +87,15 @@ async def check_leetify_stats():
 
     for steam_id, player_name in TRACKED_PLAYERS.items():
         try:
-            # FIXED: Target the actual v3 match history endpoint query parameter
             url = f"https://api-public.cs-prod.leetify.com/v3/profile/matches"
             params = {"steam64Id": steam_id}
             response = requests.get(url, headers=headers, params=params)
             if response.status_code != 200: continue
                 
-            matches = response.json()
-            if not matches: continue
+            data = response.json()
+            # SAFE UNWRAP: Target Leetify's 'list' key data array 
+            matches = data.get("list", []) if isinstance(data, dict) else data
+            if not isinstance(matches, list) or not matches: continue
 
             latest_match = matches[0]
             match_id = latest_match.get("matchId")
@@ -103,7 +105,6 @@ async def check_leetify_stats():
                 continue
 
             if match_id != last_seen_matches[steam_id]:
-                # FIXED: Updated match details to use v2 routing requirements
                 detail_url = f"https://api-public.cs-prod.leetify.com/v2/matches/{match_id}"
                 detail_res = requests.get(detail_url, headers=headers)
                 
@@ -142,7 +143,6 @@ async def player_stats_command(ctx, name: str = None):
     await ctx.send(f"📊 Querying latest match arrays for **{name}**...")
     
     try:
-        # FIXED: Core profile match history mapping aligned to schema
         url = f"https://api-public.cs-prod.leetify.com/v3/profile/matches"
         params = {"steam64Id": steam_id}
         res = requests.get(url, headers=headers, params=params)
@@ -151,8 +151,11 @@ async def player_stats_command(ctx, name: str = None):
             await ctx.send(f"⚠️ Leetify blocked the request. (Error code: `{res.status_code}`).")
             return
             
-        matches = res.json()
-        if not matches:
+        data = res.json()
+        # SAFE UNWRAP: Access the list layer out of the API dictionary safely
+        matches = data.get("list", []) if isinstance(data, dict) else data
+        
+        if not isinstance(matches, list) or not matches:
             await ctx.send(f"❌ No games found on Leetify for {name}.")
             return
 
@@ -173,7 +176,7 @@ async def player_stats_command(ctx, name: str = None):
                 games_calculated += 1
 
         if games_calculated == 0:
-            await ctx.send("⚠️ Stats found, but couldn't parse the internal values.")
+            await ctx.send("⚠️ Stats found, but couldn't parse individual values.")
             return
 
         embed = discord.Embed(
@@ -206,7 +209,6 @@ async def test_match_command(ctx):
     headers = {"_leetify_key": LEETIFY_API_KEY}
     
     try:
-        # FIXED: Adjusted history URL structure to use query arguments 
         url = f"https://api-public.cs-prod.leetify.com/v3/profile/matches"
         params = {"steam64Id": first_steam_id}
         res = requests.get(url, headers=headers, params=params)
@@ -215,9 +217,16 @@ async def test_match_command(ctx):
             await ctx.send(f"⚠️ Leetify blocked the history request. (Error code: `{res.status_code}`).")
             return
             
-        latest_match_id = res.json()[0].get("matchId")
+        data = res.json()
+        # SAFE UNWRAP: Targets the 'list' array index to prevent internal key errors
+        matches = data.get("list", []) if isinstance(data, dict) else data
         
-        # FIXED: Details mapped to the functional v2 system
+        if not isinstance(matches, list) or not matches:
+            await ctx.send("❌ No match records found inside the payload structure.")
+            return
+            
+        latest_match_id = matches[0].get("matchId")
+        
         detail_url = f"https://api-public.cs-prod.leetify.com/v2/matches/{latest_match_id}"
         detail_res = requests.get(detail_url, headers=headers)
         
