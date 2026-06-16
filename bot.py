@@ -214,4 +214,10 @@ async def test_match_command(ctx):
         if detail_res.status_code == 200:
             embed = process_match_data(latest_match_id, detail_res.json())
             if embed:
-                await ctx.send(content="✅ **Pipeline Verification Complete! Here
+                await ctx.send(content="✅ **Pipeline Verification Complete! Here is how game outcomes will render:**", embed=embed)
+                return
+                
+        await ctx.send("❌ Found a match record, but your SteamID wasn't recognized inside it.")
+            
+    except Exception as e:
+        await ctx.send(f"Pipeline Test Error Encountered: {e}")
