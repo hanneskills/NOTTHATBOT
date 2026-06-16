@@ -78,12 +78,12 @@ def process_match_data(match_id, match_data):
 async def check_leetify_stats():
     if not LEETIFY_API_KEY: return
 
-    # FIXED: Using Leetify's custom authentication header requirement
     headers = {"_leetify_key": LEETIFY_API_KEY}
 
     for steam_id, player_name in TRACKED_PLAYERS.items():
         try:
-            url = f"https://api-public.cs-prod.leetify.com/api/v1/players/{steam_id}/matches"
+            # FIXED: Removed the invalid /v1/ directory path nesting
+            url = f"https://api-public.cs-prod.leetify.com/api/players/{steam_id}/matches"
             response = requests.get(url, headers=headers)
             if response.status_code != 200: continue
                 
@@ -98,7 +98,8 @@ async def check_leetify_stats():
                 continue
 
             if match_id != last_seen_matches[steam_id]:
-                detail_url = f"https://api-public.cs-prod.leetify.com/api/v1/matches/{match_id}"
+                # FIXED: Corrected match details endpoint path
+                detail_url = f"https://api-public.cs-prod.leetify.com/api/matches/{match_id}"
                 detail_res = requests.get(detail_url, headers=headers)
                 
                 if detail_res.status_code == 200:
@@ -132,12 +133,12 @@ async def player_stats_command(ctx, name: str = None):
         await ctx.send(f"❌ `{name}` isn't in your tracked config list.")
         return
 
-    # FIXED: Using Leetify's custom authentication header requirement
     headers = {"_leetify_key": LEETIFY_API_KEY}
     await ctx.send(f"📊 Querying latest match arrays for **{name}**...")
     
     try:
-        url = f"https://api-public.cs-prod.leetify.com/api/v1/players/{steam_id}/matches"
+        # FIXED: Core endpoint updated to mirror official path rules
+        url = f"https://api-public.cs-prod.leetify.com/api/players/{steam_id}/matches"
         res = requests.get(url, headers=headers)
         
         if res.status_code != 200:
@@ -196,11 +197,11 @@ async def test_match_command(ctx):
     first_name = TRACKED_PLAYERS[first_steam_id]
     
     await ctx.send(f"🔎 Scanning data pipelines for {first_name}'s last recorded match data...")
-    # FIXED: Using Leetify's custom authentication header requirement
     headers = {"_leetify_key": LEETIFY_API_KEY}
     
     try:
-        url = f"https://api-public.cs-prod.leetify.com/api/v1/players/{first_steam_id}/matches"
+        # FIXED: Match history lookup URL corrected 
+        url = f"https://api-public.cs-prod.leetify.com/api/players/{first_steam_id}/matches"
         res = requests.get(url, headers=headers)
         
         if res.status_code != 200:
@@ -209,7 +210,8 @@ async def test_match_command(ctx):
             
         latest_match_id = res.json()[0].get("matchId")
         
-        detail_url = f"https://api-public.cs-prod.leetify.com/api/v1/matches/{latest_match_id}"
+        # FIXED: Details endpoint path corrected
+        detail_url = f"https://api-public.cs-prod.leetify.com/api/matches/{latest_match_id}"
         detail_res = requests.get(detail_url, headers=headers)
         
         if detail_res.status_code == 200:
