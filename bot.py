@@ -22,8 +22,7 @@ intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 active_signups = {}
 
-# --- ⚙️ CONFIGURATION (CHANGE THESE) ---
-# Replace with your squad's 17-digit Steam64 IDs and their names
+# --- ⚙️ CONFIGURATION ---
 TRACKED_PLAYERS = {
     "76561198722789242": "Hanneskills",
 }
@@ -37,13 +36,11 @@ last_seen_matches = {}
 @bot.event
 async def on_ready():
     print(f'⚡ Bot is online and vibing as {bot.user}')
-    # Start the automated 2-minute Leetify checker
     check_leetify_stats.start()
 
 
 # --- HELPER FUNCTION: PARSE & CONSTRUCT EMBED FROM MATCH DATA ---
 def process_match_data(match_id, match_data):
-    """Shared core parser that structures Leetify match JSON data into a clean Discord Embed."""
     map_name = match_data.get("mapName", "Unknown Map").title()
     scoreline = f"{match_data.get('teamScores', {}).get('ct', 0)} - {match_data.get('teamScores', {}).get('t', 0)}"
     
@@ -77,19 +74,14 @@ def process_match_data(match_id, match_data):
 
 
 # --- FEATURE 1: LEETIFY AUTOMATED MATCH REPORT BACKGROUND LOOP ---
-
 @tasks.loop(minutes=2)
 async def check_leetify_stats():
-    if not LEETIFY_API_KEY:
-        print("⚠️ Leetify API Key missing from Environment Variables.")
-        return
+    if not LEETIFY_API_KEY: return
 
     headers = {"Authorization": f"Bearer {LEETIFY_API_KEY}"}
-    games_to_report = {}
 
     for steam_id, player_name in TRACKED_PLAYERS.items():
         try:
-            # Request player's match history
             url = f"https://api-public.cs-prod.leetify.com/api/v1/players/{steam_id}/matches"
             response = requests.get(url, headers=headers)
             if response.status_code != 200: continue
@@ -100,22 +92,17 @@ async def check_leetify_stats():
             latest_match = matches[0]
             match_id = latest_match.get("matchId")
 
-            # Seed data on first boot so it doesn't dump old history
             if steam_id not in last_seen_matches:
                 last_seen_matches[steam_id] = match_id
                 continue
 
-            # Process if it's a completely new match
             if match_id != last_seen_matches[steam_id]:
                 detail_url = f"https://api-public.cs-prod.leetify.com/api/v1/matches/{match_id}"
                 detail_res = requests.get(detail_url, headers=headers)
                 
                 if detail_res.status_code == 200:
-                    match_data = detail_res.json()
-                    embed = process_match_data(match_id, match_data)
-                    
+                    embed = process_match_data(match_id, detail_res.json())
                     if embed:
-                        # Scan all available servers for a text channel named exactly 'leetify'
                         for guild in bot.guilds:
                             channel = discord.utils.get(guild.text_channels, name="leetify")
                             if channel:
@@ -127,58 +114,81 @@ async def check_leetify_stats():
             print(f"Error updating Leetify stats for {player_name}: {e}")
 
 
-# --- NEW CUSTOM COMMAND: !stats [name] ---
+# --- CUSTOM COMMAND: !stats [name] ---
 @bot.command(name="stats")
 async def player_stats_command(ctx, name: str = None):
-    """Fetches career averages (Aim, Util, Leetify rating) for a tracked player."""
+    """Calculates form averages from the last 5 games via Leetify."""
     if not LEETIFY_API_KEY:
-        await ctx.send("⚠️ Leetify API key is missing from environment variables.")
+        await ctx.send("⚠️ Leetify API key is missing from Render.")
         return
         
     if not name:
-        await ctx.send(f"Provide a name. Example: `!stats Hanneskills` (Tracked: {', '.join(TRACKED_PLAYERS.values())})")
+        await ctx.send(f"Provide a name. Example: `!stats Hanneskills`")
         return
 
-    # Cross-reference the argument name with tracked Steam IDs
     steam_id = next((sid for sid, p_name in TRACKED_PLAYERS.items() if p_name.lower() == name.lower()), None)
     if not steam_id:
-        await ctx.send(f"❌ `{name}` isn't in your tracked configuration profile layout.")
+        await ctx.send(f"❌ `{name}` isn't in your tracked config list.")
         return
 
     headers = {"Authorization": f"Bearer {LEETIFY_API_KEY}"}
+    await ctx.send(f"📊 Querying latest match arrays for **{name}**...")
     
     try:
-        url = f"https://api-public.cs-prod.leetify.com/api/v1/players/{steam_id}"
+        url = f"https://api-public.cs-prod.leetify.com/api/v1/players/{steam_id}/matches"
         res = requests.get(url, headers=headers)
         
         if res.status_code != 200:
-            await ctx.send(f"⚠️ Unable to query Leetify overview endpoints for {name}.")
+            print(f"[STATS CMD ERROR] Status code from Leetify: {res.status_code}")
+            await ctx.send(f"⚠️ Leetify blocked the request. (Error code: `{res.status_code}`). Check your API key on Render!")
             return
             
-        data = res.json()
-        recent_ratings = data.get("recentGameRatings", {})
+        matches = res.json()
+        if not matches:
+            await ctx.send(f"❌ No games found on Leetify for {name}.")
+            return
+
+        sample_size = min(len(matches), 5)
+        recent_games = matches[:sample_size]
         
+        total_leetify, total_aim, total_utility, games_calculated = 0, 0, 0, 0
+
+        for match in recent_games:
+            l_rating = match.get("leetifyRating")
+            aim_r = match.get("ratings", {}).get("aim")
+            util_r = match.get("ratings", {}).get("utility")
+            
+            if l_rating is not None and aim_r is not None and util_r is not None:
+                total_leetify += l_rating
+                total_aim += aim_r
+                total_utility += util_r
+                games_calculated += 1
+
+        if games_calculated == 0:
+            await ctx.send(f"⚠️ Stats found, but couldn't parse the internal values.")
+            return
+
         embed = discord.Embed(
-            title=f"📊 General Leetify Profile: {name}",
+            title=f"📈 Performance Form Summary: {name}",
+            description=f"Averages calculated over last `{games_calculated}` matches.",
             url=f"https://leetify.com/app/profile/{steam_id}",
             color=discord.Color.blue()
         )
-        embed.add_field(name="Leetify Rating", value=f"`{round(recent_ratings.get('leetify', 0), 2)}`", inline=True)
-        embed.add_field(name="Aim Rating", value=f"`{round(recent_ratings.get('aim', 0), 1)}`", inline=True)
-        embed.add_field(name="Utility Rating", value=f"`{round(recent_ratings.get('utility', 0), 1)}`", inline=True)
-        
+        embed.add_field(name="Avg Leetify Rating", value=f"`{round(total_leetify / games_calculated, 2)}`", inline=True)
+        embed.add_field(name="Avg Aim Rating", value=f"`{round(total_aim / games_calculated, 1)}`", inline=True)
+        embed.add_field(name="Avg Utility Rating", value=f"`{round(total_utility / games_calculated, 1)}`", inline=True)
         await ctx.send(embed=embed)
         
     except Exception as e:
-        await ctx.send(f"Error handling profile data request processing: {e}")
+        await ctx.send(f"Error processing stats command: {e}")
 
 
-# --- NEW CUSTOM COMMAND: !testmatch ---
+# --- CUSTOM COMMAND: !testmatch ---
 @bot.command(name="testmatch")
 async def test_match_command(ctx):
     """Force-pulls the absolute last match played by the first tracked player to test layout output."""
     if not LEETIFY_API_KEY:
-        await ctx.send("⚠️ Leetify API Key missing.")
+        await ctx.send("⚠️ Leetify API Key missing from Render.")
         return
 
     first_steam_id = list(TRACKED_PLAYERS.keys())[0]
@@ -191,8 +201,9 @@ async def test_match_command(ctx):
         url = f"https://api-public.cs-prod.leetify.com/api/v1/players/{first_steam_id}/matches"
         res = requests.get(url, headers=headers)
         
-        if res.status_code != 200 or not res.json():
-            await ctx.send("⚠️ Failed fetching history array pipelines from Leetify.")
+        if res.status_code != 200:
+            print(f"[TESTMATCH CMD ERROR] Status code from Leetify: {res.status_code}")
+            await ctx.send(f"⚠️ Leetify blocked the history request. (Error code: `{res.status_code}`). Check your API key on Render!")
             return
             
         latest_match_id = res.json()[0].get("matchId")
@@ -203,67 +214,4 @@ async def test_match_command(ctx):
         if detail_res.status_code == 200:
             embed = process_match_data(latest_match_id, detail_res.json())
             if embed:
-                await ctx.send(content="✅ **Pipeline Verification Complete! Here is how game outcomes will render:**", embed=embed)
-                return
-                
-        await ctx.send("❌ Found a match record, but no configured tracking profile match-ups inside it.")
-            
-    except Exception as e:
-        await ctx.send(f"Pipeline Test Error Encountered: {e}")
-
-
-# --- FEATURE 2: THE "WHO'S PLAYING" SIGNUP ---
-
-@bot.event
-async def on_message(message):
-    if message.author == bot.user: return
-    content = message.content.lower()
-    if "game" in content or "playing" in content:
-        embed = discord.Embed(title="🎮 Who's playing tonight?", description="Click the **✅** reaction below to join the squad!", color=discord.Color.blurple())
-        embed.add_field(name="Players Joined:", value="*No one yet...*", inline=False)
-        signup_message = await message.channel.send(embed=embed)
-        await signup_message.add_reaction("✅")
-        active_signups[signup_message.id] = set()
-    await bot.process_commands(message)
-
-@bot.event
-async def on_reaction_add(reaction, user):
-    if user == bot.user: return
-    if reaction.message.id in active_signups and str(reaction.emoji) == "✅":
-        player_ids = active_signups[reaction.message.id]
-        if user.id not in player_ids:
-            player_ids.add(user.id)
-            await update_signup_embed(reaction.message, player_ids)
-
-@bot.event
-async def on_reaction_remove(reaction, user):
-    if user == bot.user: return
-    if reaction.message.id in active_signups and str(reaction.emoji) == "✅":
-        player_ids = active_signups[reaction.message.id]
-        if user.id in player_ids:
-            player_ids.remove(user.id)
-            await update_signup_embed(reaction.message, player_ids)
-
-async def update_signup_embed(message, player_ids):
-    embed = message.embeds[0]
-    player_mentions = "\n".join([f"• <@{user_id}>" for user_id in player_ids]) if player_ids else "*No one yet...*"
-    embed.set_field_at(0, name="Players Joined:", value=player_mentions, inline=False)
-    await message.edit(embed=embed)
-
-
-# --- FEATURE 3: AUTO GAMER ROLE FOR VOICE CHAT ---
-
-@bot.event
-async def on_voice_state_update(member, before, after):
-    guild = member.guild
-    gamer_role = discord.utils.get(guild.roles, name=ROLE_NAME)
-    if not gamer_role: return
-    if before.channel is None and after.channel is not None:
-        await member.add_roles(gamer_role)
-    elif before.channel is not None and after.channel is None:
-        await member.remove_roles(gamer_role)
-
-# --- START THE ENGINES ---
-keep_alive()
-TOKEN = os.environ.get('DISCORD_TOKEN', 'YOUR_BOT_TOKEN')
-bot.run(TOKEN)
+                await ctx.send(content="✅ **Pipeline Verification Complete! Here
