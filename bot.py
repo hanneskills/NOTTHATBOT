@@ -259,10 +259,35 @@ LEETIFY_API_KEY  = os.environ.get('LEETIFY_API_KEY')
 LEETIFY_HEADERS  = {"_leetify_key": LEETIFY_API_KEY} if LEETIFY_API_KEY else {}
 LEETIFY_BASE     = "https://api-public.cs-prod.leetify.com"
 
+STEAM_API_KEY    = os.environ.get('STEAM_API_KEY')  # Needed for custom URL resolution
+
 STEAMID64_RE     = re.compile(r'\b(7656119\d{10})\b')
 STEAM_PROFILE_RE = re.compile(r'steamcommunity\.com/profiles/(\d+)')
+STEAM_CUSTOM_RE  = re.compile(r'steamcommunity\.com/id/([^/\s?]+)')
 last_seen_matches = {}
 TRACKED_PLAYERS   = {}
+
+
+def resolve_vanity_url(vanity_name: str) -> str | None:
+    """
+    Resolves a Steam custom URL (vanity name) to a Steam64 ID.
+    Requires STEAM_API_KEY env var (free key from https://steamcommunity.com/dev/apikey).
+    """
+    if not STEAM_API_KEY:
+        return None
+    try:
+        res = requests.get(
+            "https://api.steampowered.com/ISteamUser/ResolveVanityURL/v1/",
+            params={"key": STEAM_API_KEY, "vanityurl": vanity_name},
+            timeout=10
+        )
+        if res.status_code == 200:
+            data = res.json().get("response", {})
+            if data.get("success") == 1:
+                return data.get("steamid")
+    except Exception as e:
+        print(f"[resolve_vanity_url] {e}")
+    return None
 
 # Premier rank thresholds (CS2 as of 2025)
 PREMIER_RANKS = [
@@ -331,33 +356,26 @@ def build_profile_embeds(data: dict, steam_id: str) -> list[discord.Embed]:
         color=discord.Color.blurple()
     )
 
+    # Row 1: Aim + Utility
+    e1.add_field(name="🎯 Aim Rating",     value=f"**{aim_rtg:.1f}**",  inline=True)
+    e1.add_field(name="💣 Utility Rating", value=f"**{util_rtg:.1f}**", inline=True)
+    e1.add_field(name="\u200b", value="\u200b", inline=True)  # spacer
+
+    # Row 2: Reaction Time + Leetify Rating
+    e1.add_field(name="⚡ Reaction Time",  value=f"**{reaction_ms:.0f} ms**", inline=True)
     e1.add_field(
-        name="🏆 Rank",
-        value=f"**{rank_label}** ({premier_rating:,})\nPeak: {peak_label} ({peak_rating:,})",
-        inline=True
-    )
-    e1.add_field(
-        name="⚡ Reaction Time",
-        value=f"**{reaction_ms:.0f} ms**",
+        name="📈 Leetify Rating",
+        value=f"CT **{leetify_ct*100:+.1f}** · T **{leetify_t*100:+.1f}** · avg **{leetify_avg*100:+.1f}**",
         inline=True
     )
     e1.add_field(name="\u200b", value="\u200b", inline=True)  # spacer
 
-    e1.add_field(
-        name="🎯 Aim Rating",
-        value=f"**{aim_rtg:.1f}**",
-        inline=True
-    )
-    e1.add_field(
-        name="💣 Utility Rating",
-        value=f"**{util_rtg:.1f}**",
-        inline=True
-    )
-    e1.add_field(
-        name="📈 Leetify Rating",
-        value=f"CT **{leetify_ct*100:+.1f}** · T **{leetify_t*100:+.1f}** · avg **{leetify_avg*100:+.1f}**",
-        inline=False
-    )
+    # Row 3: Current rank number + Peak rank number
+    rank_val = str(premier_rating) if premier_rating else "Unranked"
+    peak_val = str(peak_rating)    if peak_rating    else "—"
+    e1.add_field(name="🏆 Current Rank", value=f"**{rank_val}**", inline=True)
+    e1.add_field(name="📈 Highest Rank", value=f"**{peak_val}**", inline=True)
+    e1.add_field(name="\u200b", value="\u200b", inline=True)  # spacer
 
     e1.set_footer(text=f"Steam ID: {steam_id}")
     embeds.append(e1)
@@ -373,26 +391,26 @@ def build_profile_embeds(data: dict, steam_id: str) -> list[discord.Embed]:
             color=discord.Color.dark_blue()
         )
 
-        lines = ["`{:<10} {:>6} {:>5} {:>5} {:>6} {:>6}`".format(
-            "MAP", "SCORE", "AIM", "LTF", "REACT", "RESULT"
+        lines = ["`{:<10} {:>6} {:>3} {:>3} {:>5} {:>6}`".format(
+            "MAP", "SCORE", "K", "D", "LTF", "RESULT"
         )]
 
         for m in matches:
             map_short = m.get("map_name", "?").replace("de_", "").replace("cs_", "")[:10]
             score     = m.get("score", [0, 0])
             score_str = f"{score[0]}-{score[1]}" if isinstance(score, list) else str(score)
-            aim       = m.get("accuracy_enemy_spotted", 0)
+            kills     = m.get("total_kills", 0) or 0
+            deaths    = m.get("total_deaths", 0) or 0
             ltf       = m.get("leetify_rating", 0) or 0
-            react     = m.get("reaction_time_ms", 0) or 0
             outcome   = m.get("outcome", "?")
             result    = {"win": "✅W", "loss": "❌L", "tie": "➖T"}.get(outcome, "?")
 
-            lines.append("`{:<10} {:>6} {:>4}% {:>+5.1f} {:>5}ms {:>6}`".format(
-                map_short, score_str, round(aim), ltf * 100, round(react), result
+            lines.append("`{:<10} {:>6} {:>3} {:>3} {:>+5.1f} {:>6}`".format(
+                map_short, score_str, kills, deaths, ltf * 100, result
             ))
 
         e2.description = "\n".join(lines)
-        e2.set_footer(text="AIM = accuracy vs spotted enemies · LTF = Leetify rating ×100")
+        e2.set_footer(text="LTF = Leetify rating ×100 · K = Kills · D = Deaths")
         embeds.append(e2)
 
     return embeds
@@ -407,11 +425,24 @@ async def handle_steamid_lookup(message):
         return
 
     steam_id = None
-    url_match = STEAM_PROFILE_RE.search(message.content)
-    id_match  = STEAMID64_RE.search(message.content)
+    url_match    = STEAM_PROFILE_RE.search(message.content)
+    custom_match = STEAM_CUSTOM_RE.search(message.content)
+    id_match     = STEAMID64_RE.search(message.content)
 
     if url_match:
         steam_id = url_match.group(1)
+    elif custom_match:
+        vanity = custom_match.group(1)
+        steam_id = resolve_vanity_url(vanity)
+        if not steam_id:
+            if not STEAM_API_KEY:
+                await message.reply(
+                    "⚠️ Custom Steam URLs need a `STEAM_API_KEY` env var to resolve. "
+                    "Get a free key at <https://steamcommunity.com/dev/apikey> and add it to your environment."
+                )
+            else:
+                await message.reply(f"❌ Couldn't resolve custom URL `{vanity}` to a Steam64 ID.")
+            return
     elif id_match:
         steam_id = id_match.group(1)
 
@@ -419,17 +450,30 @@ async def handle_steamid_lookup(message):
         return
 
     if not LEETIFY_API_KEY:
-        await message.channel.send("⚠️ `LEETIFY_API_KEY` is not set.")
+        await message.reply("⚠️ `LEETIFY_API_KEY` is not set.")
         return
 
     async with message.channel.typing():
         data = fetch_profile(steam_id)
         if not data:
-            await message.channel.send(f"❌ Couldn't fetch Leetify profile for `{steam_id}`.")
+            # NOTE: As of April 2026, Leetify's public API only returns data for
+            # registered users. Unregistered players DO have stats tracked internally
+            # (visible on leetify.com and third-party sites like csst.at that use the
+            # web frontend), but Leetify explicitly restricted their public API to
+            # registered accounts for privacy compliance reasons. There is currently
+            # no supported bypass via the public API.
+            await message.reply(
+                f"❌ No Leetify data for `{steam_id}`.\n"
+                "ℹ️ This player may not be **registered** on Leetify. "
+                "As of April 2026, Leetify's public API only returns stats for registered users — "
+                "unregistered players' data is visible on [leetify.com](https://leetify.com) directly "
+                "but is not accessible via the API. "
+                f"You can check manually: <https://leetify.com/app/profile/{steam_id}>"
+            )
             return
 
         embeds = build_profile_embeds(data, steam_id)
-        await message.channel.send(embeds=embeds)
+        await message.reply(embeds=embeds)
 
 
 # =================================================================
@@ -634,10 +678,13 @@ async def stats_command(ctx, steam_id: str):
     async with ctx.typing():
         data = fetch_profile(steam_id)
         if not data:
-            await ctx.send(f"❌ Couldn't fetch profile for `{steam_id}`.")
+            await ctx.reply(
+                f"❌ No Leetify data for `{steam_id}`.\n"
+                "ℹ️ This player may not be registered on Leetify — the public API only returns stats for registered users."
+            )
             return
         embeds = build_profile_embeds(data, steam_id)
-        await ctx.send(embeds=embeds)
+        await ctx.reply(embeds=embeds)
 
 # =================================================================
 # 10. ON READY
