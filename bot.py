@@ -35,20 +35,22 @@ ROLE_NAME = "gamer"
 # 3. SUPABASE SETUP
 # =================================================================
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
-SUPABASE_HEADERS = {
-    "apikey": SUPABASE_KEY,
-    "Authorization": f"Bearer {SUPABASE_KEY}",
-    "Content-Type": "application/json"
-}
+SUPABASE_URL = os.environ.get("SUPABASE_URL")  # e.g. https://xxxx.supabase.co  (no trailing slash)
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")  # the eyJ... anon/public key
+
+def get_supabase_headers():
+    return {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json"
+    }
 
 def db_load_tracked():
     """Load all tracked players from Supabase. Returns dict {steam_id: display_name}."""
     try:
         res = requests.get(
             f"{SUPABASE_URL}/rest/v1/tracked_players?select=steam_id,display_name",
-            headers=SUPABASE_HEADERS,
+            headers=get_supabase_headers(),
             timeout=10
         )
         if res.status_code == 200:
@@ -65,7 +67,7 @@ def db_add_player(steam_id, display_name):
     try:
         res = requests.post(
             f"{SUPABASE_URL}/rest/v1/tracked_players",
-            headers={**SUPABASE_HEADERS, "Prefer": "resolution=merge-duplicates"},
+            headers={**get_supabase_headers(), "Prefer": "resolution=merge-duplicates"},
             json={"steam_id": steam_id, "display_name": display_name},
             timeout=10
         )
@@ -79,7 +81,7 @@ def db_remove_player(steam_id):
     try:
         res = requests.delete(
             f"{SUPABASE_URL}/rest/v1/tracked_players?steam_id=eq.{steam_id}",
-            headers=SUPABASE_HEADERS,
+            headers=get_supabase_headers(),
             timeout=10
         )
         return res.status_code in (200, 204)
@@ -94,6 +96,7 @@ def db_remove_player(steam_id):
 @bot.listen('on_message')
 async def handle_game_signups(message):
     if message.author == bot.user: return
+    if message.content.startswith("!"): return
     content = message.content.lower()
     if "game" in content or "playing" in content:
         embed = discord.Embed(
@@ -147,11 +150,9 @@ LEETIFY_API_KEY = os.environ.get('LEETIFY_API_KEY')
 LEETIFY_HEADERS = {"_leetify_key": LEETIFY_API_KEY} if LEETIFY_API_KEY else {}
 LEETIFY_BASE    = "https://api-public.cs-prod.leetify.com"
 
-STEAMID64_RE    = re.compile(r'\b(7656119\d{10})\b')
+STEAMID64_RE      = re.compile(r'\b(7656119\d{10})\b')
 last_seen_matches = {}
-
-# In-memory cache, loaded from Supabase on startup
-TRACKED_PLAYERS = {}
+TRACKED_PLAYERS   = {}  # loaded from Supabase on startup
 
 
 def build_match_embed(match_data, tracked_only=True):
@@ -183,19 +184,19 @@ def build_match_embed(match_data, tracked_only=True):
             if not tracked_only:
                 name = p.get("name") or sid
 
-            k    = p.get("total_kills",    0)
-            d    = p.get("total_deaths",   0)
-            adr  = p.get("adr",            None)
-            aim  = p.get("aim_rating",     None)
-            util = p.get("utility_rating", None)
+            k       = p.get("total_kills", 0)
+            d       = p.get("total_deaths", 0)
+            damage  = p.get("total_damage", 0)
+            rounds  = p.get("rounds_count", 1)
+            adr     = round(damage / rounds, 1) if rounds else 0
+            rating  = p.get("leetify_rating", None)
+            hs_pct  = round((p.get("total_hs_kills", 0) / k * 100)) if k else 0
 
-            adr_str  = f"{adr:.1f}"  if adr  is not None else "—"
-            aim_str  = f"{aim:.1f}"  if aim  is not None else "—"
-            util_str = f"{util:.1f}" if util is not None else "—"
+            rating_str = f"{rating:.3f}" if rating is not None else "—"
 
             rows.append(
                 f"**{name}**\n"
-                f"  K/D: `{k}/{d}` · ADR: `{adr_str}` · Aim: `{aim_str}` · Util: `{util_str}`"
+                f"  K/D: `{k}/{d}` · ADR: `{adr}` · HS%: `{hs_pct}%` · Rating: `{rating_str}`"
             )
 
         label = "Squad Performance" if tracked_only else "Player Stats"
@@ -212,6 +213,7 @@ def build_match_embed(match_data, tracked_only=True):
 @bot.listen('on_message')
 async def handle_steamid_lookup(message):
     if message.author == bot.user: return
+    if message.content.startswith("!"): return  # ignore bot commands
 
     match = STEAMID64_RE.search(message.content)
     if not match: return
@@ -341,24 +343,9 @@ async def on_ready():
     check_leetify_stats.start()
 
 
-@bot.command(name="rawstats")
-async def raw_stats(ctx, steam_id: str):
-    res = requests.get(
-        f"{LEETIFY_BASE}/v3/profile/matches",
-        headers=LEETIFY_HEADERS,
-        params={"steam64_id": steam_id},
-        timeout=10
-    )
-    p = res.json()[0]["stats"][0]  # first player's raw stat fields
-    field_list = "\n".join(f"`{k}`: {v}" for k, v in p.items())
-    # Split into chunks if too long
-    for i in range(0, len(field_list), 1900):
-        await ctx.send(field_list[i:i+1900])
-
 # =================================================================
 # 7. RUN
 # =================================================================
 
 keep_alive()
 bot.run(os.environ.get("DISCORD_TOKEN"))
-
