@@ -152,12 +152,30 @@ last_seen_matches = {}
 TRACKED_PLAYERS   = {}  # loaded from Supabase on startup
 
 
+def fetch_full_match(match_id):
+    """Fetch all 10 players from /v2/matches/{id}."""
+    try:
+        res = requests.get(
+            f"{LEETIFY_BASE}/v2/matches/{match_id}",
+            headers=LEETIFY_HEADERS,
+            timeout=10
+        )
+        if res.status_code == 200:
+            return res.json()
+        else:
+            print(f"[fetch_full_match] Status {res.status_code} for match {match_id}")
+            return None
+    except Exception as e:
+        print(f"[fetch_full_match] Error: {e}")
+        return None
+
+
 def build_match_embed(match_data):
     """Build a full 10-player leaderboard embed, with tracked players starred."""
     try:
         map_name  = match_data.get("map_name", "Unknown").replace("de_", "").title()
         match_id  = match_data.get("id", "")
-        game_date = (match_data.get("game_finished_at") or "")[:10]
+        game_date = (match_data.get("finished_at") or match_data.get("game_finished_at") or "")[:10]
 
         team_scores = match_data.get("team_scores", [])
         s_ct = next((s.get("score", 0) for s in team_scores if s.get("team_number") == 3), 0)
@@ -184,8 +202,8 @@ def build_match_embed(match_data):
 
         for p in all_stats:
             sid        = str(p.get("steam64_id", ""))
-            name       = TRACKED_PLAYERS.get(sid) or p.get("name") or sid
             is_tracked = sid in TRACKED_PLAYERS
+            name       = TRACKED_PLAYERS.get(sid) or p.get("name") or sid
 
             k          = p.get("total_kills", 0)
             d          = p.get("total_deaths", 0)
@@ -221,7 +239,7 @@ def build_match_embed(match_data):
 @bot.listen('on_message')
 async def handle_steamid_lookup(message):
     if message.author == bot.user: return
-    if message.content.startswith("!"): return  # ignore bot commands
+    if message.content.startswith("!"): return
 
     match = STEAMID64_RE.search(message.content)
     if not match: return
@@ -234,6 +252,7 @@ async def handle_steamid_lookup(message):
 
     async with message.channel.typing():
         try:
+            # Step 1: get the latest match ID for this player
             res = requests.get(
                 f"{LEETIFY_BASE}/v3/profile/matches",
                 headers=LEETIFY_HEADERS,
@@ -249,7 +268,14 @@ async def handle_steamid_lookup(message):
                 await message.channel.send("No recent matches found for that Steam ID.")
                 return
 
-            embed = build_match_embed(matches[0])
+            # Step 2: fetch the full 10-player match
+            match_id   = matches[0].get("id")
+            match_data = fetch_full_match(match_id)
+            if not match_data:
+                await message.channel.send("Could not fetch full match data.")
+                return
+
+            embed = build_match_embed(match_data)
             if embed:
                 await message.channel.send(content=f"📊 Latest match for `{steam_id}`:", embed=embed)
             else:
@@ -287,7 +313,7 @@ async def remove_player(ctx, steam_id: str):
     if ok:
         await ctx.send(f"🗑️ Removed **{name}** from tracking.")
     else:
-        await ctx.send(f"Removed **{name}** from memory, but Supabase delete failed — check your credentials.")
+        await ctx.send(f"Removed **{name}** from memory, but Supabase delete failed.")
 
 @bot.command(name="players")
 async def list_players(ctx):
@@ -298,6 +324,34 @@ async def list_players(ctx):
     lines = [f"• **{name}** — `{sid}`" for sid, name in TRACKED_PLAYERS.items()]
     await ctx.send("**Tracked players:**\n" + "\n".join(lines))
 
+@bot.command(name="lastmatch")
+@commands.has_permissions(manage_guild=True)
+async def last_match(ctx, steam_id: str):
+    """!lastmatch <steam64id> — force-post the most recent match"""
+    res = requests.get(
+        f"{LEETIFY_BASE}/v3/profile/matches",
+        headers=LEETIFY_HEADERS,
+        params={"steam64_id": steam_id},
+        timeout=10
+    )
+    if res.status_code != 200:
+        await ctx.send(f"❌ Leetify returned `{res.status_code}`.")
+        return
+    matches = res.json()
+    if not matches:
+        await ctx.send("No matches found.")
+        return
+    match_id   = matches[0].get("id")
+    match_data = fetch_full_match(match_id)
+    if not match_data:
+        await ctx.send("Could not fetch full match data.")
+        return
+    embed = build_match_embed(match_data)
+    if embed:
+        await ctx.send(embed=embed)
+    else:
+        await ctx.send("Could not parse match data.")
+
 
 # --- Periodic match checker (every 2 min) ---
 @tasks.loop(minutes=2)
@@ -305,7 +359,7 @@ async def check_leetify_stats():
     if not LEETIFY_API_KEY or not TRACKED_PLAYERS:
         return
 
-    seen_this_tick = set()  # prevent duplicate posts if multiple tracked players finished the same match
+    seen_this_tick = set()  # prevent duplicate posts for the same match
 
     for steam_id in list(TRACKED_PLAYERS.keys()):
         try:
@@ -326,18 +380,22 @@ async def check_leetify_stats():
             latest_id = latest.get("id")
 
             if steam_id not in last_seen_matches:
-                last_seen_matches[steam_id] = latest_id  # first run, just record — don't post
+                last_seen_matches[steam_id] = latest_id  # first run, just record
             elif latest_id != last_seen_matches[steam_id]:
                 last_seen_matches[steam_id] = latest_id
 
                 if latest_id not in seen_this_tick:
                     seen_this_tick.add(latest_id)
-                    embed = build_match_embed(latest)
-                    if embed:
-                        for guild in bot.guilds:
-                            channel = discord.utils.get(guild.text_channels, name="leetify")
-                            if channel:
-                                await channel.send(embed=embed)
+
+                    # Fetch the full 10-player match data
+                    match_data = fetch_full_match(latest_id)
+                    if match_data:
+                        embed = build_match_embed(match_data)
+                        if embed:
+                            for guild in bot.guilds:
+                                channel = discord.utils.get(guild.text_channels, name="leetify")
+                                if channel:
+                                    await channel.send(embed=embed)
 
         except Exception as e:
             print(f"[check_leetify_stats] {steam_id}: {e}")
@@ -355,27 +413,9 @@ async def on_ready():
     print(f"📋 Loaded {len(TRACKED_PLAYERS)} tracked player(s) from Supabase.")
     check_leetify_stats.start()
 
-# =================================================================
-# 8. RAWMATCH
-# =================================================================
 
-@bot.command(name="rawmatch2")
-@commands.has_permissions(manage_guild=True)
-async def raw_match2(ctx, match_id: str):
-    res = requests.get(
-        f"{LEETIFY_BASE}/v2/matches/{match_id}",
-        headers=LEETIFY_HEADERS,
-        timeout=10
-    )
-    await ctx.send(f"Status: `{res.status_code}`")
-    if res.status_code == 200:
-        data = res.json()
-        keys = list(data.keys())
-        stat_count = len(data.get("stats", []))
-        await ctx.send(f"Keys: `{keys}`\nStat entries: `{stat_count}`")
-        
 # =================================================================
-# 9. RUN
+# 7. RUN
 # =================================================================
 
 keep_alive()
