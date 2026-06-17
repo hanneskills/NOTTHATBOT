@@ -359,21 +359,20 @@ async def on_ready():
 # 8. RAWMATCH
 # =================================================================
 
-@bot.command(name="rawmatch")
+@bot.command(name="rawmatch2")
 @commands.has_permissions(manage_guild=True)
-async def raw_match(ctx, steam_id: str):
+async def raw_match2(ctx, match_id: str):
     res = requests.get(
-        f"{LEETIFY_BASE}/v3/profile/matches",
+        f"{LEETIFY_BASE}/v2/matches/{match_id}",
         headers=LEETIFY_HEADERS,
-        params={"steam64_id": steam_id},
         timeout=10
     )
-    match = res.json()[0]
-    # Show top-level keys and how many entries are in "stats"
-    keys = list(match.keys())
-    stat_count = len(match.get("stats", []))
-    match_id = match.get("id")
-    await ctx.send(f"Keys: `{keys}`\nStat entries: `{stat_count}`\nMatch ID: `{match_id}`")
+    await ctx.send(f"Status: `{res.status_code}`")
+    if res.status_code == 200:
+        data = res.json()
+        keys = list(data.keys())
+        stat_count = len(data.get("stats", []))
+        await ctx.send(f"Keys: `{keys}`\nStat entries: `{stat_count}`")
         
 # =================================================================
 # 9. RUN
