@@ -185,8 +185,10 @@ async def handle_game_signups(message):
     # Delete the old poll, carry over the player list
     await delete_active_poll()
     reset_poll_state(keep_players=True, game_ts=game_ts)
+    # Explicitly write game_ts after reset so it always reflects the latest message
+    active_poll["game_ts"] = game_ts
 
-    embed = build_poll_embed(active_poll["players"], game_ts)
+    embed = build_poll_embed(active_poll["players"], active_poll["game_ts"])
 
     signup_message = await message.channel.send(embed=embed)
     await signup_message.add_reaction("✅")
@@ -478,8 +480,8 @@ def build_match_embed(match_data: dict) -> discord.Embed | None:
         t_players  = [p for p in all_stats if p.get("initial_team_number") != 3]
 
         def format_side(players):
-            lines = ["`{:<16} {:>3} {:>3} {:>5} {:>4} {:>6}`".format(
-                "NAME", "K", "D", "ADR", "HS%", "RTG"
+            lines = ["`{:<16} {:>3} {:>3} {:>5} {:>4} {:>8}`".format(
+                "NAME", "K", "D", "ADR", "HS%", "RATING"
             )]
             for p in players:
                 sid        = str(p.get("steam64_id", ""))
@@ -494,7 +496,7 @@ def build_match_embed(match_data: dict) -> discord.Embed | None:
                 rating = p.get("leetify_rating", None)
                 hs_pct = round((p.get("total_hs_kills", 0) / k * 100)) if k else 0
                 rtg    = f"{rating * 100:.1f}" if rating is not None else "—"
-                lines.append("`{:<16} {:>3} {:>3} {:>5} {:>3}% {:>6}`".format(
+                lines.append("`{:<16} {:>3} {:>3} {:>5} {:>3}% {:>8}`".format(
                     display, k, d, adr, hs_pct, rtg
                 ))
             return "\n".join(lines)
