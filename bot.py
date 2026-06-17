@@ -355,9 +355,35 @@ async def on_ready():
     print(f"📋 Loaded {len(TRACKED_PLAYERS)} tracked player(s) from Supabase.")
     check_leetify_stats.start()
 
-
 # =================================================================
-# 7. RUN
+# 8. CHECK LAST MATCH
+# =================================================================
+
+@bot.command(name="lastmatch")
+@commands.has_permissions(manage_guild=True)
+async def last_match(ctx, steam_id: str):
+    """!lastmatch <steam64id> — force-post the most recent match to this channel"""
+    res = requests.get(
+        f"{LEETIFY_BASE}/v3/profile/matches",
+        headers=LEETIFY_HEADERS,
+        params={"steam64_id": steam_id},
+        timeout=10
+    )
+    if res.status_code != 200:
+        await ctx.send(f"❌ Leetify returned `{res.status_code}`.")
+        return
+    matches = res.json()
+    if not matches:
+        await ctx.send("No matches found.")
+        return
+    embed = build_match_embed(matches[0])
+    if embed:
+        await ctx.send(embed=embed)
+    else:
+        await ctx.send("Could not parse match data.")
+        
+# =================================================================
+# 9. RUN
 # =================================================================
 
 keep_alive()
