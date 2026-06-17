@@ -123,10 +123,10 @@ def build_poll_embed(player_ids: set, game_ts: int | None) -> discord.Embed:
     if game_ts:
         # "Who's playing in 2 hours?" — uses Discord's relative timestamp in the title
         title = f"🎮 Who's playing <t:{game_ts}:R>?"
-        footer = f"Game starts at <t:{game_ts}:t> your time · React ✅ to join · 🗑️ to remove"
+        footer = f"Game starts at <t:{game_ts}:t> your time · React ✅ to join · ❌ to leave · 🗑️ to remove poll"
     else:
         title  = "🎮 Who's playing tonight?"
-        footer = "React ✅ to join · 🗑️ to remove this poll"
+        footer = "React ✅ to join · ❌ to leave · 🗑️ to remove poll"
 
     player_mentions = (
         "\n".join(f"• <@{uid}>" for uid in player_ids)
@@ -192,6 +192,7 @@ async def handle_game_signups(message):
 
     signup_message = await message.channel.send(embed=embed)
     await signup_message.add_reaction("✅")
+    await signup_message.add_reaction("❌")
     await signup_message.add_reaction("🗑️")
 
     active_poll["message_id"] = signup_message.id
@@ -205,27 +206,30 @@ async def on_reaction_add(reaction, user):
     if reaction.message.id != active_poll["message_id"]:
         return
 
-    if str(reaction.emoji) == "✅":
+    emoji = str(reaction.emoji)
+
+    # Always remove the user's reaction so only the bot's stays visible
+    try:
+        await reaction.message.remove_reaction(reaction.emoji, user)
+    except Exception:
+        pass
+
+    if emoji == "✅":
         active_poll["players"].add(user.id)
         embed = build_poll_embed(active_poll["players"], active_poll["game_ts"])
         await reaction.message.edit(embed=embed)
 
-    elif str(reaction.emoji) == "🗑️":
+    elif emoji == "❌":
+        active_poll["players"].discard(user.id)
+        embed = build_poll_embed(active_poll["players"], active_poll["game_ts"])
+        await reaction.message.edit(embed=embed)
+
+    elif emoji == "🗑️":
         await reaction.message.delete()
         reset_poll_state(keep_players=False)
 
 
-@bot.event
-async def on_reaction_remove(reaction, user):
-    if user == bot.user:
-        return
-    if reaction.message.id != active_poll["message_id"]:
-        return
 
-    if str(reaction.emoji) == "✅":
-        active_poll["players"].discard(user.id)
-        embed = build_poll_embed(active_poll["players"], active_poll["game_ts"])
-        await reaction.message.edit(embed=embed)
 
 
 # --- Reset poll completely at 3 AM UTC every day ---
@@ -318,7 +322,7 @@ def fetch_profile(steam_id: str) -> dict | None:
         return None
 
 
-def build_profile_embeds(data: dict, steam_id: str) -> list[discord.Embed]:
+async def build_profile_embeds(data: dict, steam_id: str) -> list[discord.Embed]:
     """
     Returns a list of embeds:
       [0] — overall stat card
@@ -399,24 +403,24 @@ def build_profile_embeds(data: dict, steam_id: str) -> list[discord.Embed]:
             map_short = m.get("map_name", "?").replace("de_", "").replace("cs_", "")[:10]
             score     = m.get("score", [0, 0])
             score_str = f"{score[0]}-{score[1]}" if isinstance(score, list) else str(score)
-
-            # K/D: prefer stats array (same structure as match detail endpoint),
-            # fall back to top-level keys some profile endpoints expose.
-            player_stat = next(
-                (s for s in m.get("stats", []) if str(s.get("steam64_id")) == str(steam_id)),
-                None
-            )
-            if player_stat:
-                kills  = player_stat.get("total_kills", 0) or 0
-                deaths = player_stat.get("total_deaths", 0) or 0
-                ltf    = player_stat.get("leetify_rating", 0) or 0
-            else:
-                kills  = m.get("total_kills", 0) or m.get("kills", 0) or 0
-                deaths = m.get("total_deaths", 0) or m.get("deaths", 0) or 0
-                ltf    = m.get("leetify_rating", 0) or 0
-
+            ltf       = m.get("leetify_rating", 0) or 0
             outcome   = m.get("outcome", "?")
-            result    = {"win": "✅W", "loss": "❌L", "tie": "➖T"}.get(outcome, "?")
+            result    = {"win": "\u2705W", "loss": "\u274cL", "tie": "\u2796T"}.get(outcome, "?")
+
+            # Fetch full match detail to get K/D (not present in profile's recent_matches)
+            kills, deaths = 0, 0
+            match_id = m.get("id") or m.get("match_id")
+            if match_id:
+                detail = fetch_full_match(match_id)
+                if detail:
+                    player_stat = next(
+                        (s for s in detail.get("stats", [])
+                         if str(s.get("steam64_id")) == str(steam_id)),
+                        None
+                    )
+                    if player_stat:
+                        kills  = player_stat.get("total_kills", 0) or 0
+                        deaths = player_stat.get("total_deaths", 0) or 0
 
             lines.append("`{:<10} {:>6} {:>3} {:>3} {:>+5.1f} {:>6}`".format(
                 map_short, score_str, kills, deaths, ltf * 100, result
@@ -485,7 +489,7 @@ async def handle_steamid_lookup(message):
             )
             return
 
-        embeds = build_profile_embeds(data, steam_id)
+        embeds = await build_profile_embeds(data, steam_id)
         await message.reply(embeds=embeds)
 
 
@@ -696,7 +700,7 @@ async def stats_command(ctx, steam_id: str):
                 "ℹ️ This player may not be registered on Leetify — the public API only returns stats for registered users."
             )
             return
-        embeds = build_profile_embeds(data, steam_id)
+        embeds = await build_profile_embeds(data, steam_id)
         await ctx.reply(embeds=embeds)
 
 # =================================================================
