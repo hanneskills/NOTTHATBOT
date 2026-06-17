@@ -356,31 +356,24 @@ async def on_ready():
     check_leetify_stats.start()
 
 # =================================================================
-# 8. CHECK LAST MATCH
+# 8. RAWMATCH
 # =================================================================
 
-@bot.command(name="lastmatch")
+@bot.command(name="rawmatch")
 @commands.has_permissions(manage_guild=True)
-async def last_match(ctx, steam_id: str):
-    """!lastmatch <steam64id> — force-post the most recent match to this channel"""
+async def raw_match(ctx, steam_id: str):
     res = requests.get(
         f"{LEETIFY_BASE}/v3/profile/matches",
         headers=LEETIFY_HEADERS,
         params={"steam64_id": steam_id},
         timeout=10
     )
-    if res.status_code != 200:
-        await ctx.send(f"❌ Leetify returned `{res.status_code}`.")
-        return
-    matches = res.json()
-    if not matches:
-        await ctx.send("No matches found.")
-        return
-    embed = build_match_embed(matches[0])
-    if embed:
-        await ctx.send(embed=embed)
-    else:
-        await ctx.send("Could not parse match data.")
+    match = res.json()[0]
+    # Show top-level keys and how many entries are in "stats"
+    keys = list(match.keys())
+    stat_count = len(match.get("stats", []))
+    match_id = match.get("id")
+    await ctx.send(f"Keys: `{keys}`\nStat entries: `{stat_count}`\nMatch ID: `{match_id}`")
         
 # =================================================================
 # 9. RUN
