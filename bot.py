@@ -90,27 +90,25 @@ async def on_ready():
 
 # --- HELPER FUNCTIONS ---
 def extract_steam_id(input_str):
-    # If the user provides a raw 17-digit ID
     if input_str.isdigit() and len(input_str) == 17:
         return input_str
-    # If it's a URL, attempt to find a 17-digit ID string
     match = re.search(r'(\d{17})', input_str)
-    if match:
-        return match.group(1)
-    return input_str # Returns original if no ID found
+    return match.group(1) if match else input_str
 
 def process_match_data(match_data):
     if not isinstance(match_data, dict): return None
 
     map_name = match_data.get("map_name", "Unknown").replace("de_", "").title()
     team_scores = match_data.get('team_scores', [])
-    # Scores are usually in the order of team_number 2 and 3
-    ct_score = next((s['score'] for s in team_scores if s.get('team_number') == 3), 0)
-    t_score = next((s['score'] for s in team_scores if s.get('team_number') == 2), 0)
+    
+    # Use team_number (2 or 3) instead of 'faction'
+    # Team 2 is usually T, Team 3 is usually CT
+    score_2 = next((s['score'] for s in team_scores if s.get('team_number') == 2), 0)
+    score_3 = next((s['score'] for s in team_scores if s.get('team_number') == 3), 0)
     
     embed = discord.Embed(
         title=f"🏆 Match Leaderboard: {map_name}",
-        description=f"Final Score: **CT {ct_score} - {t_score} T**\n[View on Leetify](https://leetify.com/app/match-details/{match_data.get('id')})",
+        description=f"Final Score: **CT {score_3} - {score_2} T**\n[View on Leetify](https://leetify.com/app/match-details/{match_data.get('id')})",
         color=discord.Color.gold()
     )
     
@@ -121,7 +119,9 @@ def process_match_data(match_data):
         name = p.get("name", "Unknown")
         k = p.get("total_kills", 0)
         d = p.get("total_deaths", 0)
-        adr = round(p.get("total_damage", 0) / p.get("rounds_count", 1), 0)
+        # Calculate ADR safely
+        rounds = p.get("rounds_count", 1)
+        adr = round(p.get("total_damage", 0) / (rounds if rounds > 0 else 1), 0)
         rating = round(p.get("leetify_rating", 0), 2)
         board += f"**{name}**: {k}/{d} | ADR: {adr} | Rating: {rating}\n"
     
@@ -153,7 +153,7 @@ async def check_leetify_stats():
 @bot.command(name="stats")
 async def player_stats_command(ctx, input_str: str = None):
     if not input_str:
-        await ctx.send("Usage: `!stats <Steam64ID_or_ProfileURL>`")
+        await ctx.send("Usage: `!stats <Steam64ID>`")
         return
 
     steam_id = extract_steam_id(input_str)
@@ -161,7 +161,7 @@ async def player_stats_command(ctx, input_str: str = None):
     res = requests.get("https://api-public.cs-prod.leetify.com/v3/profile/matches", headers=headers, params={"steam64_id": steam_id})
     
     if res.status_code != 200:
-        await ctx.send(f"❌ Error {res.status_code}: Could not fetch stats. Check if profile is public.")
+        await ctx.send("❌ Error fetching stats. Ensure profile is public.")
         return
             
     matches = res.json()[:5]
@@ -184,5 +184,3 @@ async def test_match_command(ctx):
     res = requests.get("https://api-public.cs-prod.leetify.com/v3/profile/matches", headers={"_leetify_key": LEETIFY_API_KEY}, params={"steam64_id": first_id})
     if res.status_code == 200 and res.json():
         await ctx.send(embed=process_match_data(res.json()[0]))
-    else:
-        await ctx.send(f"Failed: {res.status_code} - {res.text}")
