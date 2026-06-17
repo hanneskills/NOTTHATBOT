@@ -410,14 +410,18 @@ async def build_profile_embeds(data: dict, steam_id: str) -> list[discord.Embed]
             # Fetch full match detail to get K/D (not present in profile's recent_matches)
             kills, deaths = 0, 0
             match_id = m.get("id") or m.get("match_id")
+            print(f"[DEBUG recent_match keys] {list(m.keys())}")
+            print(f"[DEBUG match_id] {match_id!r}")
             if match_id:
                 detail = fetch_full_match(match_id)
+                print(f"[DEBUG detail] {'OK' if detail else 'NONE'} for {match_id!r}")
                 if detail:
                     player_stat = next(
                         (s for s in detail.get("stats", [])
                          if str(s.get("steam64_id")) == str(steam_id)),
                         None
                     )
+                    print(f"[DEBUG player_stat found] {player_stat is not None}")
                     if player_stat:
                         kills  = player_stat.get("total_kills", 0) or 0
                         deaths = player_stat.get("total_deaths", 0) or 0
