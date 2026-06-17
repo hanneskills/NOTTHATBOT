@@ -192,7 +192,7 @@ def build_match_embed(match_data, tracked_only=True):
             rating  = p.get("leetify_rating", None)
             hs_pct  = round((p.get("total_hs_kills", 0) / k * 100)) if k else 0
 
-            rating_str = f"{rating:.3f}" if rating is not None else "—"
+            rating_str = f"{rating * 100:.2f}" if rating is not None else "—"
 
             rows.append(
                 f"**{name}**\n"
