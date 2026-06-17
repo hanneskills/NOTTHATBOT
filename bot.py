@@ -89,45 +89,111 @@ def db_remove_player(steam_id):
 # 4. DISCORD FEATURES (Signups, Reactions, Voice Roles)
 # =================================================================
 
+import re
+from datetime import datetime, timezone, timedelta
+
+# Only listen for game signups in this channel name
+SIGNUP_CHANNEL = "general"
+
+def parse_time_offset(text):
+    """
+    Looks for time expressions like 'in 2 hours', 'in 20 minutes', 'in 1.5 hours'.
+    Returns a UTC datetime if found, else None.
+    """
+    text = text.lower()
+    match = re.search(r'in\s+(\d+(?:\.\d+)?)\s*(hour|hr|minute|min)s?', text)
+    if not match:
+        return None
+    amount = float(match.group(1))
+    unit   = match.group(2)
+    if unit in ("hour", "hr"):
+        delta = timedelta(hours=amount)
+    else:
+        delta = timedelta(minutes=amount)
+    return datetime.now(timezone.utc) + delta
+
+
 @bot.listen('on_message')
 async def handle_game_signups(message):
     if message.author == bot.user: return
     if message.content.startswith("!"): return
+    if message.channel.name != SIGNUP_CHANNEL: return
+
     content = message.content.lower()
-    if "game" in content or "playing" in content:
-        embed = discord.Embed(
-            title="🎮 Who's playing tonight?",
-            description="Click the **✅** reaction below to join the squad!",
-            color=discord.Color.blurple()
-        )
-        embed.add_field(name="Players Joined:", value="*No one yet...*", inline=False)
-        signup_message = await message.channel.send(embed=embed)
-        await signup_message.add_reaction("✅")
-        active_signups[signup_message.id] = set()
+    if not ("game" in content or "playing" in content):
+        return
+
+    # Mark all existing signups as closed
+    for msg_id in active_signups:
+        active_signups[msg_id]["closed"] = True
+
+    # Detect optional time
+    game_time = parse_time_offset(message.content)
+    if game_time:
+        ts        = int(game_time.timestamp())
+        time_line = f"🕐 Starting <t:{ts}:R> (<t:{ts}:t>)"  # e.g. "in 23 minutes (10:45 PM)"
+    else:
+        time_line = ""
+
+    description = "Click **✅** to join · 🗑️ to remove this poll"
+    if time_line:
+        description += f"\n{time_line}"
+
+    embed = discord.Embed(
+        title="🎮 Who's playing tonight?",
+        description=description,
+        color=discord.Color.blurple()
+    )
+    embed.add_field(name="Players Joined:", value="*No one yet...*", inline=False)
+
+    signup_message = await message.channel.send(embed=embed)
+    await signup_message.add_reaction("✅")
+    await signup_message.add_reaction("🗑️")
+
+    active_signups[signup_message.id] = {
+        "players": set(),
+        "closed": False
+    }
+
 
 @bot.event
 async def on_reaction_add(reaction, user):
     if user == bot.user: return
-    if reaction.message.id in active_signups and str(reaction.emoji) == "✅":
-        player_ids = active_signups[reaction.message.id]
-        if user.id not in player_ids:
-            player_ids.add(user.id)
-            await update_signup_embed(reaction.message, player_ids)
+    entry = active_signups.get(reaction.message.id)
+    if not entry: return
+    if entry.get("closed"): return
+
+    if str(reaction.emoji) == "✅":
+        if user.id not in entry["players"]:
+            entry["players"].add(user.id)
+            await update_signup_embed(reaction.message, entry["players"])
+
+    elif str(reaction.emoji) == "🗑️":
+        # Anyone can delete with the trashcan
+        entry["closed"] = True
+        await reaction.message.delete()
+        active_signups.pop(reaction.message.id, None)
+
 
 @bot.event
 async def on_reaction_remove(reaction, user):
     if user == bot.user: return
-    if reaction.message.id in active_signups and str(reaction.emoji) == "✅":
-        player_ids = active_signups[reaction.message.id]
-        if user.id in player_ids:
-            player_ids.remove(user.id)
-            await update_signup_embed(reaction.message, player_ids)
+    entry = active_signups.get(reaction.message.id)
+    if not entry: return
+    if entry.get("closed"): return
+
+    if str(reaction.emoji) == "✅":
+        if user.id in entry["players"]:
+            entry["players"].remove(user.id)
+            await update_signup_embed(reaction.message, entry["players"])
+
 
 async def update_signup_embed(message, player_ids):
     embed = message.embeds[0]
     player_mentions = "\n".join([f"• <@{uid}>" for uid in player_ids]) if player_ids else "*No one yet...*"
     embed.set_field_at(0, name="Players Joined:", value=player_mentions, inline=False)
     await message.edit(embed=embed)
+
 
 @bot.event
 async def on_voice_state_update(member, before, after):
