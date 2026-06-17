@@ -1,10 +1,11 @@
 import os
+import re
 import discord
 import requests
-import re
 from discord.ext import commands, tasks
 from threading import Thread
 from flask import Flask
+from datetime import datetime, timezone, timedelta
 
 # =================================================================
 # 1. MINI WEB SERVER (keeps Render service alive)
@@ -28,8 +29,22 @@ intents.voice_states = True
 intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-active_signups = {}
-ROLE_NAME = "gamer"
+ROLE_NAME      = "gamer"
+SIGNUP_CHANNEL = "general"
+
+# Holds the single active poll globally (one per bot instance)
+# Structure: {
+#   "message_id": int,
+#   "channel_id": int,
+#   "players": set of user_ids,
+#   "game_ts": int or None   (unix timestamp of game start, if provided)
+# }
+active_poll = {
+    "message_id": None,
+    "channel_id": None,
+    "players": set(),
+    "game_ts": None,
+}
 
 # =================================================================
 # 3. SUPABASE SETUP
@@ -49,8 +64,7 @@ def db_load_tracked():
     try:
         res = requests.get(
             f"{SUPABASE_URL}/rest/v1/tracked_players?select=steam_id,display_name",
-            headers=get_supabase_headers(),
-            timeout=10
+            headers=get_supabase_headers(), timeout=10
         )
         if res.status_code == 200:
             return {row["steam_id"]: row["display_name"] for row in res.json()}
@@ -65,8 +79,7 @@ def db_add_player(steam_id, display_name):
         res = requests.post(
             f"{SUPABASE_URL}/rest/v1/tracked_players",
             headers={**get_supabase_headers(), "Prefer": "resolution=merge-duplicates"},
-            json={"steam_id": steam_id, "display_name": display_name},
-            timeout=10
+            json={"steam_id": steam_id, "display_name": display_name}, timeout=10
         )
         return res.status_code in (200, 201)
     except Exception as e:
@@ -77,8 +90,7 @@ def db_remove_player(steam_id):
     try:
         res = requests.delete(
             f"{SUPABASE_URL}/rest/v1/tracked_players?steam_id=eq.{steam_id}",
-            headers=get_supabase_headers(),
-            timeout=10
+            headers=get_supabase_headers(), timeout=10
         )
         return res.status_code in (200, 204)
     except Exception as e:
@@ -86,162 +98,358 @@ def db_remove_player(steam_id):
         return False
 
 # =================================================================
-# 4. DISCORD FEATURES (Signups, Reactions, Voice Roles)
+# 4. POLL HELPERS
 # =================================================================
-
-import re
-from datetime import datetime, timezone, timedelta
-
-# Only listen for game signups in this channel name
-SIGNUP_CHANNEL = "general"
 
 def parse_time_offset(text):
     """
-    Looks for time expressions like 'in 2 hours', 'in 20 minutes', 'in 1.5 hours'.
+    Looks for 'in 2 hours', 'in 20 minutes', 'in 1.5 hours'.
     Returns a UTC datetime if found, else None.
     """
-    text = text.lower()
-    match = re.search(r'in\s+(\d+(?:\.\d+)?)\s*(hour|hr|minute|min)s?', text)
+    match = re.search(r'in\s+(\d+(?:\.\d+)?)\s*(hour|hr|minute|min)s?', text.lower())
     if not match:
         return None
     amount = float(match.group(1))
     unit   = match.group(2)
-    if unit in ("hour", "hr"):
-        delta = timedelta(hours=amount)
-    else:
-        delta = timedelta(minutes=amount)
+    delta  = timedelta(hours=amount) if unit in ("hour", "hr") else timedelta(minutes=amount)
     return datetime.now(timezone.utc) + delta
 
 
+def build_poll_embed(player_ids: set, game_ts: int | None) -> discord.Embed:
+    """
+    Builds the signup embed. Title changes based on whether a time was given.
+    Uses Discord's adaptive timestamp for the game time.
+    """
+    if game_ts:
+        # "Who's playing in 2 hours?" — uses Discord's relative timestamp in the title
+        title = f"🎮 Who's playing <t:{game_ts}:R>?"
+        footer = f"Game starts at <t:{game_ts}:t> your time · React ✅ to join · 🗑️ to remove"
+    else:
+        title  = "🎮 Who's playing tonight?"
+        footer = "React ✅ to join · 🗑️ to remove this poll"
+
+    player_mentions = (
+        "\n".join(f"• <@{uid}>" for uid in player_ids)
+        if player_ids else "*No one yet...*"
+    )
+
+    embed = discord.Embed(title=title, color=discord.Color.blurple())
+    embed.add_field(name=f"Players ({len(player_ids)}):", value=player_mentions, inline=False)
+    embed.set_footer(text=footer)
+    return embed
+
+
+async def delete_active_poll():
+    """Tries to delete the currently active poll message."""
+    if active_poll["message_id"] is None:
+        return
+    try:
+        channel = bot.get_channel(active_poll["channel_id"])
+        if channel:
+            msg = await channel.fetch_message(active_poll["message_id"])
+            await msg.delete()
+    except Exception:
+        pass  # Message may already be gone
+
+
+def reset_poll_state(keep_players=False, game_ts=None):
+    """Resets tracking state, optionally carrying over the player list."""
+    players = set(active_poll["players"]) if keep_players else set()
+    active_poll["message_id"] = None
+    active_poll["channel_id"] = None
+    active_poll["players"]    = players
+    active_poll["game_ts"]    = game_ts
+
+
+# =================================================================
+# 5. POLL EVENTS
+# =================================================================
+
 @bot.listen('on_message')
 async def handle_game_signups(message):
-    if message.author == bot.user: return
-    if message.content.startswith("!"): return
-    if message.channel.name != SIGNUP_CHANNEL: return
+    if message.author == bot.user:
+        return
+    if message.content.startswith("!"):
+        return
+    if message.channel.name != SIGNUP_CHANNEL:
+        return
 
     content = message.content.lower()
     if not ("game" in content or "playing" in content):
         return
 
-    # Mark all existing signups as closed
-    for msg_id in active_signups:
-        active_signups[msg_id]["closed"] = True
-
     # Detect optional time
     game_time = parse_time_offset(message.content)
-    if game_time:
-        ts        = int(game_time.timestamp())
-        time_line = f"🕐 Starting <t:{ts}:R> (<t:{ts}:t>)"  # e.g. "in 23 minutes (10:45 PM)"
-    else:
-        time_line = ""
+    game_ts   = int(game_time.timestamp()) if game_time else None
 
-    description = "Click **✅** to join · 🗑️ to remove this poll"
-    if time_line:
-        description += f"\n{time_line}"
+    # Delete the old poll, carry over the player list
+    await delete_active_poll()
+    reset_poll_state(keep_players=True, game_ts=game_ts)
 
-    embed = discord.Embed(
-        title="🎮 Who's playing tonight?",
-        description=description,
-        color=discord.Color.blurple()
-    )
-    embed.add_field(name="Players Joined:", value="*No one yet...*", inline=False)
+    embed = build_poll_embed(active_poll["players"], game_ts)
 
     signup_message = await message.channel.send(embed=embed)
     await signup_message.add_reaction("✅")
     await signup_message.add_reaction("🗑️")
 
-    active_signups[signup_message.id] = {
-        "players": set(),
-        "closed": False
-    }
+    active_poll["message_id"] = signup_message.id
+    active_poll["channel_id"] = signup_message.channel.id
 
 
 @bot.event
 async def on_reaction_add(reaction, user):
-    if user == bot.user: return
-    entry = active_signups.get(reaction.message.id)
-    if not entry: return
-    if entry.get("closed"): return
+    if user == bot.user:
+        return
+    if reaction.message.id != active_poll["message_id"]:
+        return
 
     if str(reaction.emoji) == "✅":
-        if user.id not in entry["players"]:
-            entry["players"].add(user.id)
-            await update_signup_embed(reaction.message, entry["players"])
+        active_poll["players"].add(user.id)
+        embed = build_poll_embed(active_poll["players"], active_poll["game_ts"])
+        await reaction.message.edit(embed=embed)
 
     elif str(reaction.emoji) == "🗑️":
-        # Anyone can delete with the trashcan
-        entry["closed"] = True
         await reaction.message.delete()
-        active_signups.pop(reaction.message.id, None)
+        reset_poll_state(keep_players=False)
 
 
 @bot.event
 async def on_reaction_remove(reaction, user):
-    if user == bot.user: return
-    entry = active_signups.get(reaction.message.id)
-    if not entry: return
-    if entry.get("closed"): return
+    if user == bot.user:
+        return
+    if reaction.message.id != active_poll["message_id"]:
+        return
 
     if str(reaction.emoji) == "✅":
-        if user.id in entry["players"]:
-            entry["players"].remove(user.id)
-            await update_signup_embed(reaction.message, entry["players"])
+        active_poll["players"].discard(user.id)
+        embed = build_poll_embed(active_poll["players"], active_poll["game_ts"])
+        await reaction.message.edit(embed=embed)
 
 
-async def update_signup_embed(message, player_ids):
-    embed = message.embeds[0]
-    player_mentions = "\n".join([f"• <@{uid}>" for uid in player_ids]) if player_ids else "*No one yet...*"
-    embed.set_field_at(0, name="Players Joined:", value=player_mentions, inline=False)
-    await message.edit(embed=embed)
+# --- Reset poll completely at 3 AM UTC every day ---
+@tasks.loop(minutes=1)
+async def reset_poll_at_3am():
+    now = datetime.now(timezone.utc)
+    if now.hour == 3 and now.minute == 0:
+        await delete_active_poll()
+        reset_poll_state(keep_players=False)
+        print("[Poll] Nightly reset at 03:00 UTC.")
 
+# =================================================================
+# 6. VOICE ROLE
+# =================================================================
 
 @bot.event
 async def on_voice_state_update(member, before, after):
     gamer_role = discord.utils.get(member.guild.roles, name=ROLE_NAME)
-    if not gamer_role: return
+    if not gamer_role:
+        return
     if before.channel is None and after.channel is not None:
         await member.add_roles(gamer_role)
     elif before.channel is not None and after.channel is None:
         await member.remove_roles(gamer_role)
 
 # =================================================================
-# 5. LEETIFY INTEGRATION
+# 7. LEETIFY — PROFILE STATS ON STEAM LINK
 # =================================================================
 
-LEETIFY_API_KEY   = os.environ.get('LEETIFY_API_KEY')
-LEETIFY_HEADERS   = {"_leetify_key": LEETIFY_API_KEY} if LEETIFY_API_KEY else {}
-LEETIFY_BASE      = "https://api-public.cs-prod.leetify.com"
+LEETIFY_API_KEY  = os.environ.get('LEETIFY_API_KEY')
+LEETIFY_HEADERS  = {"_leetify_key": LEETIFY_API_KEY} if LEETIFY_API_KEY else {}
+LEETIFY_BASE     = "https://api-public.cs-prod.leetify.com"
 
-STEAMID64_RE      = re.compile(r'\b(7656119\d{10})\b')
-STEAM_PROFILE_RE  = re.compile(r'steamcommunity\.com/profiles/(\d+)')
+STEAMID64_RE     = re.compile(r'\b(7656119\d{10})\b')
+STEAM_PROFILE_RE = re.compile(r'steamcommunity\.com/profiles/(\d+)')
 last_seen_matches = {}
 TRACKED_PLAYERS   = {}
 
+# Premier rank thresholds (CS2 as of 2025)
+PREMIER_RANKS = [
+    (5000,  "Silver 1"),   (7000,  "Silver 2"),  (9000,  "Gold 1"),
+    (11000, "Gold 2"),     (13000, "Platinum 1"), (15000, "Platinum 2"),
+    (17000, "Diamond 1"),  (19000, "Diamond 2"),  (21000, "Elite"),
+    (23000, "Supreme"),    (float("inf"), "Global Elite"),
+]
 
-def fetch_full_match(match_id):
-    """Fetch all 10 players from /v2/matches/{id}."""
+def premier_rank_label(rating: int) -> str:
+    for threshold, label in PREMIER_RANKS:
+        if rating < threshold:
+            return label
+    return "Global Elite"
+
+
+def fetch_profile(steam_id: str) -> dict | None:
+    try:
+        res = requests.get(
+            f"{LEETIFY_BASE}/v3/profile",
+            headers=LEETIFY_HEADERS,
+            params={"steam64_id": steam_id},
+            timeout=10
+        )
+        return res.json() if res.status_code == 200 else None
+    except Exception as e:
+        print(f"[fetch_profile] {e}")
+        return None
+
+
+def build_profile_embeds(data: dict, steam_id: str) -> list[discord.Embed]:
+    """
+    Returns a list of embeds:
+      [0] — overall stat card
+      [1] — last 5 matches
+    """
+    embeds = []
+
+    name         = data.get("name", steam_id)
+    rating       = data.get("rating", {})
+    stats        = data.get("stats", {})
+    ranks        = data.get("ranks", {})
+    recent       = data.get("recent_matches", [])
+
+    aim_rtg      = rating.get("aim", 0)
+    util_rtg     = rating.get("utility", 0)
+    leetify_ct   = rating.get("ct_leetify", 0)
+    leetify_t    = rating.get("t_leetify", 0)
+    leetify_avg  = (leetify_ct + leetify_t) / 2
+
+    reaction_ms  = stats.get("reaction_time_ms", 0)
+
+    # Premier rank & peak
+    premier_rating = ranks.get("premier", 0) or 0
+    # Peak: highest premier rating seen across recent matches
+    recent_ratings = [m.get("rank", 0) for m in recent
+                      if m.get("rank_type") == 11 and isinstance(m.get("rank"), int) and m["rank"] > 0]
+    peak_rating = max(recent_ratings) if recent_ratings else premier_rating
+    rank_label   = premier_rank_label(premier_rating) if premier_rating else "Unranked"
+    peak_label   = premier_rank_label(peak_rating)    if peak_rating    else "—"
+
+    # ── Embed 1: stat card ────────────────────────────────────────
+    e1 = discord.Embed(
+        title=f"📊 {name}",
+        url=f"https://leetify.com/app/profile/{steam_id}",
+        color=discord.Color.blurple()
+    )
+
+    e1.add_field(
+        name="🏆 Rank",
+        value=f"**{rank_label}** ({premier_rating:,})\nPeak: {peak_label} ({peak_rating:,})",
+        inline=True
+    )
+    e1.add_field(
+        name="⚡ Reaction Time",
+        value=f"**{reaction_ms:.0f} ms**",
+        inline=True
+    )
+    e1.add_field(name="\u200b", value="\u200b", inline=True)  # spacer
+
+    e1.add_field(
+        name="🎯 Aim Rating",
+        value=f"**{aim_rtg:.1f}**",
+        inline=True
+    )
+    e1.add_field(
+        name="💣 Utility Rating",
+        value=f"**{util_rtg:.1f}**",
+        inline=True
+    )
+    e1.add_field(
+        name="📈 Leetify Rating",
+        value=f"CT **{leetify_ct*100:+.1f}** · T **{leetify_t*100:+.1f}** · avg **{leetify_avg*100:+.1f}**",
+        inline=False
+    )
+
+    e1.set_footer(text=f"Steam ID: {steam_id}")
+    embeds.append(e1)
+
+    # ── Embed 2: last 5 matches ───────────────────────────────────
+    matches = [m for m in recent if m.get("rank_type") == 11][:5]
+    if not matches:
+        matches = recent[:5]
+
+    if matches:
+        e2 = discord.Embed(
+            title=f"🕹️ Last {len(matches)} Matches — {name}",
+            color=discord.Color.dark_blue()
+        )
+
+        lines = ["`{:<10} {:>6} {:>5} {:>5} {:>6} {:>6}`".format(
+            "MAP", "SCORE", "AIM", "LTF", "REACT", "RESULT"
+        )]
+
+        for m in matches:
+            map_short = m.get("map_name", "?").replace("de_", "").replace("cs_", "")[:10]
+            score     = m.get("score", [0, 0])
+            score_str = f"{score[0]}-{score[1]}" if isinstance(score, list) else str(score)
+            aim       = m.get("accuracy_enemy_spotted", 0)
+            ltf       = m.get("leetify_rating", 0) or 0
+            react     = m.get("reaction_time_ms", 0) or 0
+            outcome   = m.get("outcome", "?")
+            result    = {"win": "✅W", "loss": "❌L", "tie": "➖T"}.get(outcome, "?")
+
+            lines.append("`{:<10} {:>6} {:>4}% {:>+5.1f} {:>5}ms {:>6}`".format(
+                map_short, score_str, round(aim), ltf * 100, round(react), result
+            ))
+
+        e2.description = "\n".join(lines)
+        e2.set_footer(text="AIM = accuracy vs spotted enemies · LTF = Leetify rating ×100")
+        embeds.append(e2)
+
+    return embeds
+
+
+@bot.listen('on_message')
+async def handle_steamid_lookup(message):
+    """Auto-detect Steam profile links or Steam64 IDs pasted in any channel."""
+    if message.author == bot.user:
+        return
+    if message.content.startswith("!"):
+        return
+
+    steam_id = None
+    url_match = STEAM_PROFILE_RE.search(message.content)
+    id_match  = STEAMID64_RE.search(message.content)
+
+    if url_match:
+        steam_id = url_match.group(1)
+    elif id_match:
+        steam_id = id_match.group(1)
+
+    if not steam_id:
+        return
+
+    if not LEETIFY_API_KEY:
+        await message.channel.send("⚠️ `LEETIFY_API_KEY` is not set.")
+        return
+
+    async with message.channel.typing():
+        data = fetch_profile(steam_id)
+        if not data:
+            await message.channel.send(f"❌ Couldn't fetch Leetify profile for `{steam_id}`.")
+            return
+
+        embeds = build_profile_embeds(data, steam_id)
+        await message.channel.send(embeds=embeds)
+
+
+# =================================================================
+# 8. LEETIFY — MATCH TRACKING (periodic new-match announcer)
+# =================================================================
+
+def fetch_full_match(match_id: str) -> dict | None:
     try:
         res = requests.get(
             f"{LEETIFY_BASE}/v2/matches/{match_id}",
-            headers=LEETIFY_HEADERS,
-            timeout=10
+            headers=LEETIFY_HEADERS, timeout=10
         )
-        if res.status_code == 200:
-            return res.json()
-        print(f"[fetch_full_match] Status {res.status_code} for {match_id}")
-        return None
+        return res.json() if res.status_code == 200 else None
     except Exception as e:
-        print(f"[fetch_full_match] Error: {e}")
+        print(f"[fetch_full_match] {e}")
         return None
 
 
-def build_match_embed(match_data):
+def build_match_embed(match_data: dict) -> discord.Embed | None:
     """
-    Build a scoreboard-style embed with a monospace table layout:
-
+    Scoreboard-style embed with monospace table.
     NAME             K   D   ADR  HS%  RTG
-    Hanneskills ⭐  16   3  107   44%  16.44
-    ...
     """
     try:
         map_name  = match_data.get("map_name", "Unknown").replace("de_", "").title()
@@ -261,17 +469,15 @@ def build_match_embed(match_data):
             color=discord.Color.gold()
         )
 
-        all_stats = sorted(
+        all_stats  = sorted(
             match_data.get("stats", []),
             key=lambda p: p.get("leetify_rating", 0) or 0,
             reverse=True
         )
-
         ct_players = [p for p in all_stats if p.get("initial_team_number") == 3]
         t_players  = [p for p in all_stats if p.get("initial_team_number") != 3]
 
         def format_side(players):
-            # Header
             lines = ["`{:<16} {:>3} {:>3} {:>5} {:>4} {:>6}`".format(
                 "NAME", "K", "D", "ADR", "HS%", "RTG"
             )]
@@ -279,9 +485,7 @@ def build_match_embed(match_data):
                 sid        = str(p.get("steam64_id", ""))
                 is_tracked = sid in TRACKED_PLAYERS
                 name       = TRACKED_PLAYERS.get(sid) or p.get("name") or sid
-                # Truncate long names so the table stays aligned
                 display    = (name[:13] + "⭐" if is_tracked else name[:14]).ljust(16)
-
                 k      = p.get("total_kills", 0)
                 d      = p.get("total_deaths", 0)
                 damage = p.get("total_damage", 0)
@@ -290,7 +494,6 @@ def build_match_embed(match_data):
                 rating = p.get("leetify_rating", None)
                 hs_pct = round((p.get("total_hs_kills", 0) / k * 100)) if k else 0
                 rtg    = f"{rating * 100:.1f}" if rating is not None else "—"
-
                 lines.append("`{:<16} {:>3} {:>3} {:>5} {:>3}% {:>6}`".format(
                     display, k, d, adr, hs_pct, rtg
                 ))
@@ -302,36 +505,19 @@ def build_match_embed(match_data):
             embed.add_field(name="🟡  T Side",  value=format_side(t_players),  inline=False)
 
         return embed
-
     except Exception as e:
         print(f"[build_match_embed] {e}")
         return None
 
 
-# --- Auto-detect Steam ID or Steam profile URL pasted in any channel ---
-@bot.listen('on_message')
-async def handle_steamid_lookup(message):
-    if message.author == bot.user: return
-    if message.content.startswith("!"): return
-
-    # Try to extract a Steam64 ID — directly or from a profile URL
-    steam_id = None
-    url_match = STEAM_PROFILE_RE.search(message.content)
-    id_match  = STEAMID64_RE.search(message.content)
-
-    if url_match:
-        steam_id = url_match.group(1)
-    elif id_match:
-        steam_id = id_match.group(1)
-
-    if not steam_id:
+@tasks.loop(minutes=2)
+async def check_leetify_stats():
+    if not LEETIFY_API_KEY or not TRACKED_PLAYERS:
         return
 
-    if not LEETIFY_API_KEY:
-        await message.channel.send("⚠️ `LEETIFY_API_KEY` is not set.")
-        return
+    seen_this_tick = set()
 
-    async with message.channel.typing():
+    for steam_id in list(TRACKED_PLAYERS.keys()):
         try:
             res = requests.get(
                 f"{LEETIFY_BASE}/v3/profile/matches",
@@ -340,32 +526,38 @@ async def handle_steamid_lookup(message):
                 timeout=10
             )
             if res.status_code != 200:
-                await message.channel.send(f"❌ Leetify returned `{res.status_code}` for that Steam ID.")
-                return
+                continue
 
             matches = res.json()
             if not matches:
-                await message.channel.send("No recent matches found for that Steam ID.")
-                return
+                continue
 
-            match_id   = matches[0].get("id")
-            match_data = fetch_full_match(match_id)
-            if not match_data:
-                await message.channel.send("Could not fetch full match data.")
-                return
+            latest    = matches[0]
+            latest_id = latest.get("id")
 
-            embed = build_match_embed(match_data)
-            if embed:
-                await message.channel.send(content=f"📊 Latest match for `{steam_id}`:", embed=embed)
-            else:
-                await message.channel.send("Could not parse match data.")
+            if steam_id not in last_seen_matches:
+                last_seen_matches[steam_id] = latest_id
+            elif latest_id != last_seen_matches[steam_id]:
+                last_seen_matches[steam_id] = latest_id
+                if latest_id not in seen_this_tick:
+                    seen_this_tick.add(latest_id)
+                    match_data = fetch_full_match(latest_id)
+                    if match_data:
+                        embed = build_match_embed(match_data)
+                        if embed:
+                            for guild in bot.guilds:
+                                channel = discord.utils.get(guild.text_channels, name="leetify")
+                                if channel:
+                                    await channel.send(embed=embed)
 
         except Exception as e:
-            print(f"[handle_steamid_lookup] {e}")
-            await message.channel.send("⚠️ Something went wrong fetching stats.")
+            print(f"[check_leetify_stats] {steam_id}: {e}")
 
 
-# --- Manage tracked players (no permission required) ---
+# =================================================================
+# 9. COMMANDS
+# =================================================================
+
 @bot.command(name="addplayer")
 async def add_player(ctx, steam_id: str, *, display_name: str):
     """!addplayer <steam64id> <display name>"""
@@ -428,80 +620,25 @@ async def last_match(ctx, steam_id: str):
     else:
         await ctx.send("Could not parse match data.")
 
-@bot.command(name="profile")
-async def profile_test(ctx, steam_id: str):
-    """!profile <steam64id> — dump raw profile data from /v3/profile so we can build a stat card"""
-    res = requests.get(
-        f"{LEETIFY_BASE}/v3/profile",
-        headers=LEETIFY_HEADERS,
-        params={"steam64_id": steam_id},
-        timeout=10
-    )
-    if res.status_code != 200:
-        await ctx.send(f"❌ Status `{res.status_code}`: {res.text[:300]}")
+@bot.command(name="stats")
+async def stats_command(ctx, steam_id: str):
+    """!stats <steam64id> — show profile stat card"""
+    if not STEAMID64_RE.fullmatch(steam_id):
+        await ctx.send("❌ Invalid Steam64 ID.")
         return
-    data = res.json()
-    # Print top-level keys and a sample of useful-looking fields
-    top_keys = list(data.keys())
-    # Pull out a few likely stat fields to preview
-    preview = {k: data[k] for k in top_keys if not isinstance(data[k], (list, dict))}
-    preview_str = "\n".join(f"`{k}`: {v}" for k, v in list(preview.items())[:30])
-    list_keys   = [k for k in top_keys if isinstance(data[k], (list, dict))]
-    await ctx.send(
-        f"**Top-level keys:** `{top_keys}`\n\n"
-        f"**Scalar fields (first 30):**\n{preview_str}\n\n"
-        f"**Nested objects/lists:** `{list_keys}`"
-    )
-
-
-# --- Periodic match checker (every 2 min) ---
-@tasks.loop(minutes=2)
-async def check_leetify_stats():
-    if not LEETIFY_API_KEY or not TRACKED_PLAYERS:
+    if not LEETIFY_API_KEY:
+        await ctx.send("⚠️ `LEETIFY_API_KEY` is not set.")
         return
-
-    seen_this_tick = set()
-
-    for steam_id in list(TRACKED_PLAYERS.keys()):
-        try:
-            res = requests.get(
-                f"{LEETIFY_BASE}/v3/profile/matches",
-                headers=LEETIFY_HEADERS,
-                params={"steam64_id": steam_id},
-                timeout=10
-            )
-            if res.status_code != 200:
-                continue
-
-            matches = res.json()
-            if not matches:
-                continue
-
-            latest    = matches[0]
-            latest_id = latest.get("id")
-
-            if steam_id not in last_seen_matches:
-                last_seen_matches[steam_id] = latest_id
-            elif latest_id != last_seen_matches[steam_id]:
-                last_seen_matches[steam_id] = latest_id
-
-                if latest_id not in seen_this_tick:
-                    seen_this_tick.add(latest_id)
-                    match_data = fetch_full_match(latest_id)
-                    if match_data:
-                        embed = build_match_embed(match_data)
-                        if embed:
-                            for guild in bot.guilds:
-                                channel = discord.utils.get(guild.text_channels, name="leetify")
-                                if channel:
-                                    await channel.send(embed=embed)
-
-        except Exception as e:
-            print(f"[check_leetify_stats] {steam_id}: {e}")
-
+    async with ctx.typing():
+        data = fetch_profile(steam_id)
+        if not data:
+            await ctx.send(f"❌ Couldn't fetch profile for `{steam_id}`.")
+            return
+        embeds = build_profile_embeds(data, steam_id)
+        await ctx.send(embeds=embeds)
 
 # =================================================================
-# 6. ON READY
+# 10. ON READY
 # =================================================================
 
 @bot.event
@@ -511,10 +648,10 @@ async def on_ready():
     TRACKED_PLAYERS = db_load_tracked()
     print(f"📋 Loaded {len(TRACKED_PLAYERS)} tracked player(s) from Supabase.")
     check_leetify_stats.start()
-
+    reset_poll_at_3am.start()
 
 # =================================================================
-# 7. RUN
+# 11. RUN
 # =================================================================
 
 keep_alive()
