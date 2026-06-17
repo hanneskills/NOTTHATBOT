@@ -22,16 +22,6 @@ def keep_alive(): Thread(target=run_web_server).start()
 # 2. BOT SETUP
 # =================================================================
 
-@bot.command(name="testdb")
-@commands.has_permissions(manage_guild=True)
-async def test_db(ctx):
-    res = requests.post(
-        f"{SUPABASE_URL}/rest/v1/tracked_players",
-        headers={**get_supabase_headers(), "Prefer": "resolution=merge-duplicates"},
-        json={"steam_id": "test123", "display_name": "test"},
-        timeout=10
-    )
-    await ctx.send(f"Status: `{res.status_code}`\nResponse: ```{res.text[:500]}```")
     
 intents = discord.Intents.default()
 intents.message_content = True
@@ -353,7 +343,16 @@ async def on_ready():
     print(f"📋 Loaded {len(TRACKED_PLAYERS)} tracked player(s) from Supabase.")
     check_leetify_stats.start()
 
-
+@bot.command(name="testdb")
+@commands.has_permissions(manage_guild=True)
+async def test_db(ctx):
+    res = requests.post(
+        f"{SUPABASE_URL}/rest/v1/tracked_players",
+        headers={**get_supabase_headers(), "Prefer": "resolution=merge-duplicates"},
+        json={"steam_id": "test123", "display_name": "test"},
+        timeout=10
+    )
+    await ctx.send(f"Status: `{res.status_code}`\nResponse: ```{res.text[:500]}```")
 # =================================================================
 # 7. RUN
 # =================================================================
