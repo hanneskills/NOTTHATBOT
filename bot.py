@@ -361,20 +361,20 @@ def build_profile_embeds(data: dict, steam_id: str) -> list[discord.Embed]:
     e1.add_field(name="💣 Utility Rating", value=f"**{util_rtg:.1f}**", inline=True)
     e1.add_field(name="\u200b", value="\u200b", inline=True)  # spacer
 
-    # Row 2: Reaction Time + Leetify Rating
+    # Row 2: Reaction Time + Leetify Rating (average only)
     e1.add_field(name="⚡ Reaction Time",  value=f"**{reaction_ms:.0f} ms**", inline=True)
     e1.add_field(
         name="📈 Leetify Rating",
-        value=f"CT **{leetify_ct*100:+.1f}** · T **{leetify_t*100:+.1f}** · avg **{leetify_avg*100:+.1f}**",
+        value=f"**{leetify_avg*100:+.1f}**",
         inline=True
     )
     e1.add_field(name="\u200b", value="\u200b", inline=True)  # spacer
 
-    # Row 3: Current rank number + Peak rank number
-    rank_val = str(premier_rating) if premier_rating else "Unranked"
-    peak_val = str(peak_rating)    if peak_rating    else "—"
+    # Row 3: Current rank number + Peak rank number (thousands-separated)
+    rank_val = f"{premier_rating:,}" if premier_rating else "Unranked"
+    peak_val = f"{peak_rating:,}"    if peak_rating    else "—"
     e1.add_field(name="🏆 Current Rank", value=f"**{rank_val}**", inline=True)
-    e1.add_field(name="📈 Highest Rank", value=f"**{peak_val}**", inline=True)
+    e1.add_field(name="👑 Highest Rank", value=f"**{peak_val}**", inline=True)
     e1.add_field(name="\u200b", value="\u200b", inline=True)  # spacer
 
     e1.set_footer(text=f"Steam ID: {steam_id}")
@@ -399,9 +399,22 @@ def build_profile_embeds(data: dict, steam_id: str) -> list[discord.Embed]:
             map_short = m.get("map_name", "?").replace("de_", "").replace("cs_", "")[:10]
             score     = m.get("score", [0, 0])
             score_str = f"{score[0]}-{score[1]}" if isinstance(score, list) else str(score)
-            kills     = m.get("total_kills", 0) or 0
-            deaths    = m.get("total_deaths", 0) or 0
-            ltf       = m.get("leetify_rating", 0) or 0
+
+            # K/D: prefer stats array (same structure as match detail endpoint),
+            # fall back to top-level keys some profile endpoints expose.
+            player_stat = next(
+                (s for s in m.get("stats", []) if str(s.get("steam64_id")) == str(steam_id)),
+                None
+            )
+            if player_stat:
+                kills  = player_stat.get("total_kills", 0) or 0
+                deaths = player_stat.get("total_deaths", 0) or 0
+                ltf    = player_stat.get("leetify_rating", 0) or 0
+            else:
+                kills  = m.get("total_kills", 0) or m.get("kills", 0) or 0
+                deaths = m.get("total_deaths", 0) or m.get("deaths", 0) or 0
+                ltf    = m.get("leetify_rating", 0) or 0
+
             outcome   = m.get("outcome", "?")
             result    = {"win": "✅W", "loss": "❌L", "tie": "➖T"}.get(outcome, "?")
 
