@@ -35,8 +35,8 @@ ROLE_NAME = "gamer"
 # 3. SUPABASE SETUP
 # =================================================================
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL")  # https://xxxx.supabase.co  (no trailing slash)
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY")  # eyJ... anon/public key
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
 def get_supabase_headers():
     return {
@@ -54,9 +54,8 @@ def db_load_tracked():
         )
         if res.status_code == 200:
             return {row["steam_id"]: row["display_name"] for row in res.json()}
-        else:
-            print(f"[Supabase] Failed to load players: {res.status_code} {res.text}")
-            return {}
+        print(f"[Supabase] Failed to load: {res.status_code} {res.text}")
+        return {}
     except Exception as e:
         print(f"[Supabase] db_load_tracked error: {e}")
         return {}
@@ -148,8 +147,9 @@ LEETIFY_HEADERS   = {"_leetify_key": LEETIFY_API_KEY} if LEETIFY_API_KEY else {}
 LEETIFY_BASE      = "https://api-public.cs-prod.leetify.com"
 
 STEAMID64_RE      = re.compile(r'\b(7656119\d{10})\b')
+STEAM_PROFILE_RE  = re.compile(r'steamcommunity\.com/profiles/(\d+)')
 last_seen_matches = {}
-TRACKED_PLAYERS   = {}  # loaded from Supabase on startup
+TRACKED_PLAYERS   = {}
 
 
 def fetch_full_match(match_id):
@@ -162,16 +162,21 @@ def fetch_full_match(match_id):
         )
         if res.status_code == 200:
             return res.json()
-        else:
-            print(f"[fetch_full_match] Status {res.status_code} for match {match_id}")
-            return None
+        print(f"[fetch_full_match] Status {res.status_code} for {match_id}")
+        return None
     except Exception as e:
         print(f"[fetch_full_match] Error: {e}")
         return None
 
 
 def build_match_embed(match_data):
-    """Build a full 10-player leaderboard embed, with tracked players starred."""
+    """
+    Build a scoreboard-style embed with a monospace table layout:
+
+    NAME             K   D   ADR  HS%  RTG
+    Hanneskills ⭐  16   3  107   44%  16.44
+    ...
+    """
     try:
         map_name  = match_data.get("map_name", "Unknown").replace("de_", "").title()
         match_id  = match_data.get("id", "")
@@ -184,49 +189,51 @@ def build_match_embed(match_data):
         embed = discord.Embed(
             title=f"🎯  {map_name}  —  CT {s_ct} : {s_t} T",
             description=(
-                f"📅 {game_date}\n"
-                f"[View full match on Leetify](https://leetify.com/app/match-details/{match_id})"
+                f"📅 {game_date}  ·  "
+                f"[View on Leetify](https://leetify.com/app/match-details/{match_id})"
             ),
             color=discord.Color.gold()
         )
 
-        # Sort all players by Leetify rating descending
         all_stats = sorted(
             match_data.get("stats", []),
             key=lambda p: p.get("leetify_rating", 0) or 0,
             reverse=True
         )
 
-        ct_rows = []
-        t_rows  = []
+        ct_players = [p for p in all_stats if p.get("initial_team_number") == 3]
+        t_players  = [p for p in all_stats if p.get("initial_team_number") != 3]
 
-        for p in all_stats:
-            sid        = str(p.get("steam64_id", ""))
-            is_tracked = sid in TRACKED_PLAYERS
-            name       = TRACKED_PLAYERS.get(sid) or p.get("name") or sid
+        def format_side(players):
+            # Header
+            lines = ["`{:<16} {:>3} {:>3} {:>5} {:>4} {:>6}`".format(
+                "NAME", "K", "D", "ADR", "HS%", "RTG"
+            )]
+            for p in players:
+                sid        = str(p.get("steam64_id", ""))
+                is_tracked = sid in TRACKED_PLAYERS
+                name       = TRACKED_PLAYERS.get(sid) or p.get("name") or sid
+                # Truncate long names so the table stays aligned
+                display    = (name[:13] + "⭐" if is_tracked else name[:14]).ljust(16)
 
-            k          = p.get("total_kills", 0)
-            d          = p.get("total_deaths", 0)
-            damage     = p.get("total_damage", 0)
-            rounds     = p.get("rounds_count", 1)
-            adr        = round(damage / rounds, 1) if rounds else 0
-            rating     = p.get("leetify_rating", None)
-            hs_pct     = round((p.get("total_hs_kills", 0) / k * 100)) if k else 0
-            rating_str = f"{rating * 100:.2f}" if rating is not None else "—"
+                k      = p.get("total_kills", 0)
+                d      = p.get("total_deaths", 0)
+                damage = p.get("total_damage", 0)
+                rounds = p.get("rounds_count", 1)
+                adr    = round(damage / rounds, 1) if rounds else 0
+                rating = p.get("leetify_rating", None)
+                hs_pct = round((p.get("total_hs_kills", 0) / k * 100)) if k else 0
+                rtg    = f"{rating * 100:.1f}" if rating is not None else "—"
 
-            prefix = "⭐ " if is_tracked else "　 "
-            row = f"{prefix}**{name}** — K/D: `{k}/{d}` · ADR: `{adr}` · HS%: `{hs_pct}%` · Rating: `{rating_str}`"
+                lines.append("`{:<16} {:>3} {:>3} {:>5} {:>3}% {:>6}`".format(
+                    display, k, d, adr, hs_pct, rtg
+                ))
+            return "\n".join(lines)
 
-            team = p.get("initial_team_number")
-            if team == 3:
-                ct_rows.append(row)
-            else:
-                t_rows.append(row)
-
-        if ct_rows:
-            embed.add_field(name="🔵 CT Side", value="\n".join(ct_rows), inline=False)
-        if t_rows:
-            embed.add_field(name="🟡 T Side", value="\n".join(t_rows), inline=False)
+        if ct_players:
+            embed.add_field(name="🔵  CT Side", value=format_side(ct_players), inline=False)
+        if t_players:
+            embed.add_field(name="🟡  T Side",  value=format_side(t_players),  inline=False)
 
         return embed
 
@@ -235,16 +242,24 @@ def build_match_embed(match_data):
         return None
 
 
-# --- Auto-detect Steam ID pasted in any channel ---
+# --- Auto-detect Steam ID or Steam profile URL pasted in any channel ---
 @bot.listen('on_message')
 async def handle_steamid_lookup(message):
     if message.author == bot.user: return
     if message.content.startswith("!"): return
 
-    match = STEAMID64_RE.search(message.content)
-    if not match: return
+    # Try to extract a Steam64 ID — directly or from a profile URL
+    steam_id = None
+    url_match = STEAM_PROFILE_RE.search(message.content)
+    id_match  = STEAMID64_RE.search(message.content)
 
-    steam_id = match.group(1)
+    if url_match:
+        steam_id = url_match.group(1)
+    elif id_match:
+        steam_id = id_match.group(1)
+
+    if not steam_id:
+        return
 
     if not LEETIFY_API_KEY:
         await message.channel.send("⚠️ `LEETIFY_API_KEY` is not set.")
@@ -252,7 +267,6 @@ async def handle_steamid_lookup(message):
 
     async with message.channel.typing():
         try:
-            # Step 1: get the latest match ID for this player
             res = requests.get(
                 f"{LEETIFY_BASE}/v3/profile/matches",
                 headers=LEETIFY_HEADERS,
@@ -268,7 +282,6 @@ async def handle_steamid_lookup(message):
                 await message.channel.send("No recent matches found for that Steam ID.")
                 return
 
-            # Step 2: fetch the full 10-player match
             match_id   = matches[0].get("id")
             match_data = fetch_full_match(match_id)
             if not match_data:
@@ -286,23 +299,21 @@ async def handle_steamid_lookup(message):
             await message.channel.send("⚠️ Something went wrong fetching stats.")
 
 
-# --- Manage tracked players ---
+# --- Manage tracked players (no permission required) ---
 @bot.command(name="addplayer")
-@commands.has_permissions(manage_guild=True)
 async def add_player(ctx, steam_id: str, *, display_name: str):
     """!addplayer <steam64id> <display name>"""
     if not STEAMID64_RE.fullmatch(steam_id):
-        await ctx.send("❌ Invalid Steam64 ID (should be 17 digits starting with 7656119...).")
+        await ctx.send("❌ Invalid Steam64 ID (17 digits starting with 7656119...).")
         return
     TRACKED_PLAYERS[steam_id] = display_name
     ok = db_add_player(steam_id, display_name)
     if ok:
         await ctx.send(f"✅ Now tracking **{display_name}** (`{steam_id}`).")
     else:
-        await ctx.send("⚠️ Saved in memory but Supabase write failed — check your credentials.")
+        await ctx.send("⚠️ Saved in memory but Supabase write failed — check credentials.")
 
 @bot.command(name="removeplayer")
-@commands.has_permissions(manage_guild=True)
 async def remove_player(ctx, steam_id: str):
     """!removeplayer <steam64id>"""
     if steam_id not in TRACKED_PLAYERS:
@@ -313,7 +324,7 @@ async def remove_player(ctx, steam_id: str):
     if ok:
         await ctx.send(f"🗑️ Removed **{name}** from tracking.")
     else:
-        await ctx.send(f"Removed **{name}** from memory, but Supabase delete failed.")
+        await ctx.send(f"Removed **{name}** from memory but Supabase delete failed.")
 
 @bot.command(name="players")
 async def list_players(ctx):
@@ -325,7 +336,6 @@ async def list_players(ctx):
     await ctx.send("**Tracked players:**\n" + "\n".join(lines))
 
 @bot.command(name="lastmatch")
-@commands.has_permissions(manage_guild=True)
 async def last_match(ctx, steam_id: str):
     """!lastmatch <steam64id> — force-post the most recent match"""
     res = requests.get(
@@ -352,6 +362,31 @@ async def last_match(ctx, steam_id: str):
     else:
         await ctx.send("Could not parse match data.")
 
+@bot.command(name="profile")
+async def profile_test(ctx, steam_id: str):
+    """!profile <steam64id> — dump raw profile data from /v3/profile so we can build a stat card"""
+    res = requests.get(
+        f"{LEETIFY_BASE}/v3/profile",
+        headers=LEETIFY_HEADERS,
+        params={"steam64_id": steam_id},
+        timeout=10
+    )
+    if res.status_code != 200:
+        await ctx.send(f"❌ Status `{res.status_code}`: {res.text[:300]}")
+        return
+    data = res.json()
+    # Print top-level keys and a sample of useful-looking fields
+    top_keys = list(data.keys())
+    # Pull out a few likely stat fields to preview
+    preview = {k: data[k] for k in top_keys if not isinstance(data[k], (list, dict))}
+    preview_str = "\n".join(f"`{k}`: {v}" for k, v in list(preview.items())[:30])
+    list_keys   = [k for k in top_keys if isinstance(data[k], (list, dict))]
+    await ctx.send(
+        f"**Top-level keys:** `{top_keys}`\n\n"
+        f"**Scalar fields (first 30):**\n{preview_str}\n\n"
+        f"**Nested objects/lists:** `{list_keys}`"
+    )
+
 
 # --- Periodic match checker (every 2 min) ---
 @tasks.loop(minutes=2)
@@ -359,7 +394,7 @@ async def check_leetify_stats():
     if not LEETIFY_API_KEY or not TRACKED_PLAYERS:
         return
 
-    seen_this_tick = set()  # prevent duplicate posts for the same match
+    seen_this_tick = set()
 
     for steam_id in list(TRACKED_PLAYERS.keys()):
         try:
@@ -380,14 +415,12 @@ async def check_leetify_stats():
             latest_id = latest.get("id")
 
             if steam_id not in last_seen_matches:
-                last_seen_matches[steam_id] = latest_id  # first run, just record
+                last_seen_matches[steam_id] = latest_id
             elif latest_id != last_seen_matches[steam_id]:
                 last_seen_matches[steam_id] = latest_id
 
                 if latest_id not in seen_this_tick:
                     seen_this_tick.add(latest_id)
-
-                    # Fetch the full 10-player match data
                     match_data = fetch_full_match(latest_id)
                     if match_data:
                         embed = build_match_embed(match_data)
