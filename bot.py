@@ -82,9 +82,15 @@ TRACKED_PLAYERS = {
 LEETIFY_API_KEY = os.environ.get('LEETIFY_API_KEY')
 last_seen_matches = {}
 
+@bot.event
+async def on_ready():
+    print(f'⚡ Bot is online as {bot.user}')
+    # This start() call is essential to prevent background task errors
+    if not check_leetify_stats.is_running():
+        check_leetify_stats.start()
+
 # --- HELPER FUNCTIONS ---
 def extract_steam_id(input_str):
-    """Extracts 17-digit Steam64ID from a URL or returns the string if it's already an ID."""
     match = re.search(r'(\d{17})', input_str)
     return match.group(1) if match else input_str
 
@@ -102,7 +108,6 @@ def process_match_data(match_data):
         color=discord.Color.gold()
     )
     
-    # Sort by kills
     stats = sorted(match_data.get("stats", []), key=lambda x: x.get("kills", 0), reverse=True)
     
     board = ""
@@ -181,7 +186,12 @@ async def player_stats_command(ctx, input_str: str = None):
 @bot.command(name="testmatch")
 async def test_match_command(ctx):
     if not LEETIFY_API_KEY: return
+    # This ensures !testmatch pulls from your tracked config
     first_id = list(TRACKED_PLAYERS.keys())[0]
     res = requests.get("https://api-public.cs-prod.leetify.com/v3/profile/matches", headers={"_leetify_key": LEETIFY_API_KEY}, params={"steam64_id": first_id})
     if res.status_code == 200 and res.json():
         await ctx.send(embed=process_match_data(res.json()[0]))
+
+# Final Run command to trigger the bot
+keep_alive()
+bot.run(os.environ['DISCORD_TOKEN'])
