@@ -341,9 +341,24 @@ async def on_ready():
     check_leetify_stats.start()
 
 
+@bot.command(name="rawstats")
+async def raw_stats(ctx, steam_id: str):
+    res = requests.get(
+        f"{LEETIFY_BASE}/v3/profile/matches",
+        headers=LEETIFY_HEADERS,
+        params={"steam64_id": steam_id},
+        timeout=10
+    )
+    p = res.json()[0]["stats"][0]  # first player's raw stat fields
+    field_list = "\n".join(f"`{k}`: {v}" for k, v in p.items())
+    # Split into chunks if too long
+    for i in range(0, len(field_list), 1900):
+        await ctx.send(field_list[i:i+1900])
+
 # =================================================================
 # 7. RUN
 # =================================================================
 
 keep_alive()
 bot.run(os.environ.get("DISCORD_TOKEN"))
+
