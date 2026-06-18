@@ -322,7 +322,26 @@ def fetch_profile(steam_id: str) -> dict | None:
         return None
 
 
-async def build_profile_embeds(data: dict, steam_id: str) -> list[discord.Embed]:
+
+def fetch_profile_matches(steam_id: str) -> list | None:
+    """
+    Calls /v3/profile/matches which returns a list of matches each with a full
+    stats array (total_kills, total_deaths, leetify_rating etc. per player).
+    """
+    try:
+        res = requests.get(
+            f"{LEETIFY_BASE}/v3/profile/matches",
+            headers=LEETIFY_HEADERS,
+            params={"steam64_id": steam_id},
+            timeout=10
+        )
+        return res.json() if res.status_code == 200 else None
+    except Exception as e:
+        print(f"[fetch_profile_matches] {e}")
+        return None
+
+
+def build_profile_embeds(data: dict, steam_id: str, profile_matches: list | None = None) -> list[discord.Embed]:
     """
     Returns a list of embeds:
       [0] — overall stat card
@@ -385,13 +404,13 @@ async def build_profile_embeds(data: dict, steam_id: str) -> list[discord.Embed]
     embeds.append(e1)
 
     # ── Embed 2: last 5 matches ───────────────────────────────────
-    matches = [m for m in recent if m.get("rank_type") == 11][:5]
-    if not matches:
-        matches = recent[:5]
+    # Use profile_matches (from /v3/profile/matches) which includes full stats per player.
+    # Fall back to recent_matches from the profile for map/outcome/score only.
+    display_matches = (profile_matches or [])[:5]
 
-    if matches:
+    if display_matches:
         e2 = discord.Embed(
-            title=f"🕹️ Last {len(matches)} Matches — {name}",
+            title=f"🕹️ Last {len(display_matches)} Matches — {name}",
             color=discord.Color.dark_blue()
         )
 
@@ -399,32 +418,34 @@ async def build_profile_embeds(data: dict, steam_id: str) -> list[discord.Embed]
             "MAP", "SCORE", "K", "D", "LTF", "RESULT"
         )]
 
-        for m in matches:
+        for m in display_matches:
             map_short = m.get("map_name", "?").replace("de_", "").replace("cs_", "")[:10]
-            score     = m.get("score", [0, 0])
-            score_str = f"{score[0]}-{score[1]}" if isinstance(score, list) else str(score)
-            ltf       = m.get("leetify_rating", 0) or 0
-            outcome   = m.get("outcome", "?")
-            result    = {"win": "\u2705W", "loss": "\u274cL", "tie": "\u2796T"}.get(outcome, "?")
 
-            # Fetch full match detail to get K/D (not present in profile's recent_matches)
-            kills, deaths = 0, 0
-            match_id = m.get("id") or m.get("match_id")
-            print(f"[DEBUG recent_match keys] {list(m.keys())}")
-            print(f"[DEBUG match_id] {match_id!r}")
-            if match_id:
-                detail = fetch_full_match(match_id)
-                print(f"[DEBUG detail] {'OK' if detail else 'NONE'} for {match_id!r}")
-                if detail:
-                    player_stat = next(
-                        (s for s in detail.get("stats", [])
-                         if str(s.get("steam64_id")) == str(steam_id)),
-                        None
-                    )
-                    print(f"[DEBUG player_stat found] {player_stat is not None}")
-                    if player_stat:
-                        kills  = player_stat.get("total_kills", 0) or 0
-                        deaths = player_stat.get("total_deaths", 0) or 0
+            # Score: team_scores list [{team_number, score}, ...]
+            team_scores = m.get("team_scores", [])
+            s2 = next((s.get("score", 0) for s in team_scores if s.get("team_number") == 2), 0)
+            s3 = next((s.get("score", 0) for s in team_scores if s.get("team_number") == 3), 0)
+            score_str = f"{s2}-{s3}"
+
+            # Player stats from the full stats array
+            player_stat = next(
+                (s for s in m.get("stats", []) if str(s.get("steam64_id")) == str(steam_id)),
+                None
+            )
+            kills  = player_stat.get("total_kills",  0) or 0 if player_stat else 0
+            deaths = player_stat.get("total_deaths", 0) or 0 if player_stat else 0
+            ltf    = player_stat.get("leetify_rating", 0) or 0 if player_stat else 0
+
+            # Outcome: compare player's initial_team_number to winning team
+            my_team    = player_stat.get("initial_team_number") if player_stat else None
+            win_score  = max(s2, s3)
+            win_team   = next((s.get("team_number") for s in team_scores if s.get("score") == win_score), None)
+            if s2 == s3:
+                result = "➖T"
+            elif my_team == win_team:
+                result = "✅W"
+            else:
+                result = "❌L"
 
             lines.append("`{:<10} {:>6} {:>3} {:>3} {:>+5.1f} {:>6}`".format(
                 map_short, score_str, kills, deaths, ltf * 100, result
@@ -493,7 +514,8 @@ async def handle_steamid_lookup(message):
             )
             return
 
-        embeds = await build_profile_embeds(data, steam_id)
+        profile_matches = fetch_profile_matches(steam_id)
+        embeds = build_profile_embeds(data, steam_id, profile_matches)
         await message.reply(embeds=embeds)
 
 
@@ -704,7 +726,8 @@ async def stats_command(ctx, steam_id: str):
                 "ℹ️ This player may not be registered on Leetify — the public API only returns stats for registered users."
             )
             return
-        embeds = await build_profile_embeds(data, steam_id)
+        profile_matches = fetch_profile_matches(steam_id)
+        embeds = build_profile_embeds(data, steam_id, profile_matches)
         await ctx.reply(embeds=embeds)
 
 # =================================================================
