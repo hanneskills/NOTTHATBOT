@@ -827,7 +827,7 @@ async def build_weekly_recap(channel: discord.TextChannel) -> discord.Embed | No
     # Overall record
     embed.add_field(
         name="🎮 Games Played",
-        value=f"**{total}** total  ·  ✅ {wins}W  ❌ {losses}L  ➖ {ties}T",
+        value=f"**{total}** total ,
         inline=False
     )
 
