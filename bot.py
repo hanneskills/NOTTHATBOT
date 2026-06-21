@@ -664,6 +664,15 @@ def parse_match_embed(embed: discord.Embed) -> dict | None:
 
         players = []
         for field in embed.fields:
+            # Determine which team this field belongs to from the field name
+            field_name = field.name or ""
+            if "CT" in field_name:
+                team_label = "CT"
+            elif "T Side" in field_name or "🟡" in field_name:
+                team_label = "T"
+            else:
+                team_label = "?"
+
             # Each field value is a monospace table; first line is the header row
             lines = (field.value or "").split("\n")
             for line in lines[1:]:  # skip header
@@ -675,12 +684,9 @@ def parse_match_embed(embed: discord.Embed) -> dict | None:
                 if len(parts) < 4:
                     continue
                 # Name is everything up to the last 5 tokens (K D ADR HS% RTG)
-                # but rating/HS% may have % symbol — safest: last 5 tokens are stats
                 try:
                     rtg_str = parts[-1]
                     rating  = float(rtg_str) if rtg_str != "—" else None
-                    hs_str  = parts[-2].rstrip("%")
-                    adr_str = parts[-3]
                     deaths  = int(parts[-4])
                     kills   = int(parts[-5])
                     name    = " ".join(parts[:-5]).rstrip("⭐").strip()
@@ -689,6 +695,7 @@ def parse_match_embed(embed: discord.Embed) -> dict | None:
                         "kills":  kills,
                         "deaths": deaths,
                         "rating": rating,   # already ×100 (displayed value)
+                        "team":   team_label,
                     })
                 except (ValueError, IndexError):
                     continue
@@ -735,16 +742,21 @@ async def build_weekly_recap(channel: discord.TextChannel) -> discord.Embed | No
     map_counts: dict[str, int] = {}
 
     # Per-player: kills, deaths, games, topfrag count, bottomfrag count
+    # topfrag  = highest rating on their team that game
+    # bottomfrag = lowest rating on their team that game
     player_stats: dict[str, dict] = {}
 
     for m in matches:
         s_ct, s_t = m["score_ct"], m["score_t"]
+
+        # A team wins if they reach 13 first OR the other team surrenders (score can be
+        # anything like 10-2). We determine W/L by which score is higher — the embed
+        # title is always "CT X : Y T" from the perspective of the match, so whichever
+        # side has the higher score won. We track the match result as a single event
+        # (one win or one loss for the group) using whichever side scored more.
         if s_ct == s_t:
             ties += 1
         elif s_ct > s_t:
-            # Can't determine which "side" tracked players were on from recap;
-            # we count the match result by majority tracked-player side
-            # Simple approach: call it a win if top-score is CT (matches are from CT pov in title)
             wins += 1
         else:
             losses += 1
@@ -757,29 +769,47 @@ async def build_weekly_recap(channel: discord.TextChannel) -> discord.Embed | No
             continue
 
         # Only count tracked players for leaderboard
+        tracked_names = set(TRACKED_PLAYERS.values())
         tracked_in_match = [
             p for p in players
-            if any(p["name"].rstrip("⭐").strip() == name for name in TRACKED_PLAYERS.values())
-               or p["name"].rstrip("⭐").strip() in TRACKED_PLAYERS.values()
+            if p["name"].rstrip("⭐").strip() in tracked_names
         ]
         if not tracked_in_match:
-            # Fall back: include everyone found in the embed
             tracked_in_match = players
 
-        top_kills     = max(p["kills"] for p in tracked_in_match)
-        bottom_kills  = min(p["kills"] for p in tracked_in_match)
+        # Top/bottom frag is determined per team by Leetify rating (as shown in embed).
+        # The embed already has CT players and T players in separate fields with their
+        # own sort order (highest rating first). We reconstruct that here by grouping
+        # tracked players by the field they came from, stored as "team" in parse step.
+        # Since we don't store team info, we approximate: split by index into two halves
+        # (CT first, T second) based on how parse_match_embed iterates fields.
+        # More precisely: parse_match_embed appends CT players then T players in order,
+        # and within each side they're already sorted by rating desc (build_match_embed
+        # sorts all_stats by leetify_rating desc). So the first tracked player per side
+        # is the topfrag and the last is the bottomfrag of that side.
+        # We use the "team" field added in parse_match_embed for this.
+        for team_label in ("CT", "T"):
+            team_players = [p for p in tracked_in_match if p.get("team") == team_label]
+            if not team_players:
+                continue
+            # Already sorted by rating desc from the embed
+            topfrag_rating    = team_players[0].get("rating")
+            bottomfrag_rating = team_players[-1].get("rating")
+            best_rating  = max((p.get("rating") or float("-inf")) for p in team_players)
+            worst_rating = min((p.get("rating") or float("inf"))  for p in team_players)
 
-        for p in tracked_in_match:
-            n = p["name"].rstrip("⭐").strip()
-            if n not in player_stats:
-                player_stats[n] = {"kills": 0, "deaths": 0, "games": 0, "topfrags": 0, "bottomfrags": 0}
-            player_stats[n]["kills"]  += p["kills"]
-            player_stats[n]["deaths"] += p["deaths"]
-            player_stats[n]["games"]  += 1
-            if p["kills"] == top_kills:
-                player_stats[n]["topfrags"] += 1
-            if p["kills"] == bottom_kills:
-                player_stats[n]["bottomfrags"] += 1
+            for p in team_players:
+                n = p["name"].rstrip("⭐").strip()
+                if n not in player_stats:
+                    player_stats[n] = {"kills": 0, "deaths": 0, "games": 0, "topfrags": 0, "bottomfrags": 0}
+                player_stats[n]["kills"]  += p["kills"]
+                player_stats[n]["deaths"] += p["deaths"]
+                player_stats[n]["games"]  += 1
+                r = p.get("rating")
+                if r is not None and r == best_rating:
+                    player_stats[n]["topfrags"] += 1
+                if r is not None and r == worst_rating:
+                    player_stats[n]["bottomfrags"] += 1
 
     # ── Build embed ─────────────────────────────────────────────────
     week_label = f"{week_ago.strftime('%b %d')} – {now.strftime('%b %d, %Y')}"
@@ -795,13 +825,13 @@ async def build_weekly_recap(channel: discord.TextChannel) -> discord.Embed | No
         inline=False
     )
 
-    # Maps played
+    # Maps played — vertical list sorted by count desc
     if map_counts:
         sorted_maps = sorted(map_counts.items(), key=lambda x: x[1], reverse=True)
-        map_parts   = [f"**{name}** ×{count}" for name, count in sorted_maps]
-        embed.add_field(name="🗺️ Maps Played", value="  ·  ".join(map_parts), inline=False)
+        map_lines   = [f"**{name}** ×{count}" for name, count in sorted_maps]
+        embed.add_field(name="🗺️ Maps Played", value="\n".join(map_lines), inline=False)
 
-    # Kill leaderboard
+    # Kill leaderboard — no medals, no (g) suffix
     if player_stats:
         sorted_players = sorted(
             player_stats.items(),
@@ -809,20 +839,15 @@ async def build_weekly_recap(channel: discord.TextChannel) -> discord.Embed | No
             reverse=True
         )
 
-        lb_lines = ["`{:<16} {:>5} {:>6}`".format("PLAYER", "KILLS", "GAMES")]
-        medals   = ["🥇", "🥈", "🥉"]
-        for i, (name, s) in enumerate(sorted_players):
-            prefix = medals[i] if i < 3 else "  "
-            lb_lines.append("`{:<16} {:>5} {:>6}`".format(
-                name[:16], s["kills"], f"({s['games']}g)"
+        lb_lines = ["`{:<16} {:>5} {:>5}`".format("PLAYER", "KILLS", "GAMES")]
+        for name, s in sorted_players:
+            lb_lines.append("`{:<16} {:>5} {:>5}`".format(
+                name[:16], s["kills"], s["games"]
             ))
-            if i < 3:
-                # Prepend medal outside the code block
-                lb_lines[-1] = prefix + " " + lb_lines[-1]
 
         embed.add_field(name="🔫 Kill Leaderboard", value="\n".join(lb_lines), inline=False)
 
-        # Top & bottom fragger
+        # Top & bottom fragger (most times highest/lowest rated on their team)
         top_fragger    = max(player_stats.items(), key=lambda x: x[1]["topfrags"])
         bottom_fragger = max(player_stats.items(), key=lambda x: x[1]["bottomfrags"])
 
