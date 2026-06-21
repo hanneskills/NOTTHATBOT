@@ -789,14 +789,20 @@ async def build_weekly_recap(channel: discord.TextChannel) -> discord.Embed | No
         # is the topfrag and the last is the bottomfrag of that side.
         # We use the "team" field added in parse_match_embed for this.
         for team_label in ("CT", "T"):
+            # Full team (everyone on this side, tracked or not) — used to find the
+            # actual best/worst rating on the team so we don't falsely award top/bottomfrag
+            # to a tracked player who merely has the best/worst rating among tracked players.
+            full_team    = [p for p in players if p.get("team") == team_label]
             team_players = [p for p in tracked_in_match if p.get("team") == team_label]
-            if not team_players:
+            if not team_players or not full_team:
                 continue
-            # Already sorted by rating desc from the embed
-            topfrag_rating    = team_players[0].get("rating")
-            bottomfrag_rating = team_players[-1].get("rating")
-            best_rating  = max((p.get("rating") or float("-inf")) for p in team_players)
-            worst_rating = min((p.get("rating") or float("inf"))  for p in team_players)
+
+            # Best/worst rating across the ENTIRE team (all 5 players)
+            full_ratings = [p.get("rating") for p in full_team if p.get("rating") is not None]
+            if not full_ratings:
+                continue
+            best_rating  = max(full_ratings)
+            worst_rating = min(full_ratings)
 
             for p in team_players:
                 n = p["name"].rstrip("⭐").strip()
