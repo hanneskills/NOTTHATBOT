@@ -548,20 +548,47 @@ def build_match_embed(match_data: dict) -> discord.Embed | None:
         s_ct = next((s.get("score", 0) for s in team_scores if s.get("team_number") == 3), 0)
         s_t  = next((s.get("score", 0) for s in team_scores if s.get("team_number") == 2), 0)
 
+        # Determine result from tracked players' perspective.
+        # Find which team number the majority of tracked players were on.
+        all_stats = sorted(
+            match_data.get("stats", []),
+            key=lambda p: p.get("leetify_rating", 0) or 0,
+            reverse=True
+        )
+        tracked_teams = [
+            p.get("initial_team_number")
+            for p in all_stats
+            if str(p.get("steam64_id", "")) in TRACKED_PLAYERS
+        ]
+        if tracked_teams:
+            from collections import Counter
+            our_team = Counter(tracked_teams).most_common(1)[0][0]
+            our_score  = s_ct if our_team == 3 else s_t
+            opp_score  = s_t  if our_team == 3 else s_ct
+            if our_score > opp_score:
+                result_str = "✅ Win"
+            elif our_score < opp_score:
+                result_str = "❌ Loss"
+            else:
+                result_str = "➖ Tie"
+        else:
+            # No tracked players in this match — just show higher score side
+            if s_ct > s_t:
+                result_str = "✅ CT Win"
+            elif s_t > s_ct:
+                result_str = "✅ T Win"
+            else:
+                result_str = "➖ Tie"
+
         embed = discord.Embed(
             title=f"🎯  {map_name}  —  CT {s_ct} : {s_t} T",
             description=(
-                f"📅 {game_date}  ·  "
+                f"{result_str}  ·  📅 {game_date}  ·  "
                 f"[View on Leetify](https://leetify.com/app/match-details/{match_id})"
             ),
             color=discord.Color.gold()
         )
 
-        all_stats  = sorted(
-            match_data.get("stats", []),
-            key=lambda p: p.get("leetify_rating", 0) or 0,
-            reverse=True
-        )
         ct_players = [p for p in all_stats if p.get("initial_team_number") == 3]
         t_players  = [p for p in all_stats if p.get("initial_team_number") != 3]
 
@@ -827,7 +854,7 @@ async def build_weekly_recap(channel: discord.TextChannel) -> discord.Embed | No
     # Overall record
     embed.add_field(
         name="🎮 Games Played",
-        value=f"**{total}** total",
+        value=f"**{total}**",
         inline=False
     )
 
