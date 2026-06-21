@@ -452,7 +452,6 @@ def build_profile_embeds(data: dict, steam_id: str, profile_matches: list | None
             ))
 
         e2.description = "\n".join(lines)
-        e2.set_footer(text="LTF = Leetify rating ×100 · K = Kills · D = Deaths")
         embeds.append(e2)
 
     return embeds
@@ -644,7 +643,229 @@ async def check_leetify_stats():
 
 
 # =================================================================
-# 9. COMMANDS
+# 9. WEEKLY RECAP (Sunday 21:00 UTC)
+# =================================================================
+
+def parse_match_embed(embed: discord.Embed) -> dict | None:
+    """
+    Extract structured data from a match embed posted by the bot.
+    Returns a dict with: map, score_ct, score_t, players [{name, k, d, rating}],
+    or None if the embed doesn't look like a match embed.
+    """
+    try:
+        # Match embeds have a title like "🎯  Mirage  —  CT 13 : 8 T"
+        title = embed.title or ""
+        score_match = re.search(r'CT\s+(\d+)\s*:\s*(\d+)\s*T', title)
+        if not score_match:
+            return None
+        map_name = re.sub(r'🎯\s*', '', title.split('—')[0]).strip()
+        s_ct = int(score_match.group(1))
+        s_t  = int(score_match.group(2))
+
+        players = []
+        for field in embed.fields:
+            # Each field value is a monospace table; first line is the header row
+            lines = (field.value or "").split("\n")
+            for line in lines[1:]:  # skip header
+                # Strip backticks and parse: NAME  K  D  ADR  HS%  RATING
+                clean = line.strip().strip("`")
+                if not clean:
+                    continue
+                parts = clean.split()
+                if len(parts) < 4:
+                    continue
+                # Name is everything up to the last 5 tokens (K D ADR HS% RTG)
+                # but rating/HS% may have % symbol — safest: last 5 tokens are stats
+                try:
+                    rtg_str = parts[-1]
+                    rating  = float(rtg_str) if rtg_str != "—" else None
+                    hs_str  = parts[-2].rstrip("%")
+                    adr_str = parts[-3]
+                    deaths  = int(parts[-4])
+                    kills   = int(parts[-5])
+                    name    = " ".join(parts[:-5]).rstrip("⭐").strip()
+                    players.append({
+                        "name":   name,
+                        "kills":  kills,
+                        "deaths": deaths,
+                        "rating": rating,   # already ×100 (displayed value)
+                    })
+                except (ValueError, IndexError):
+                    continue
+
+        return {
+            "map":     map_name,
+            "score_ct": s_ct,
+            "score_t":  s_t,
+            "players":  players,
+        }
+    except Exception as e:
+        print(f"[parse_match_embed] {e}")
+        return None
+
+
+async def build_weekly_recap(channel: discord.TextChannel) -> discord.Embed | None:
+    """
+    Scrapes the last 7 days of messages in `channel`, extracts bot match embeds,
+    and returns a Weekly Recap embed.
+    """
+    now      = datetime.now(timezone.utc)
+    week_ago = now - timedelta(days=7)
+
+    matches = []  # list of parsed match dicts
+
+    async for message in channel.history(after=week_ago, limit=2000, oldest_first=False):
+        if message.author != bot.user:
+            continue
+        for embed in message.embeds:
+            parsed = parse_match_embed(embed)
+            if parsed:
+                matches.append(parsed)
+
+    if not matches:
+        return None
+
+    # ── Aggregate ───────────────────────────────────────────────────
+    total   = len(matches)
+    wins    = 0
+    losses  = 0
+    ties    = 0
+
+    # Map play counts
+    map_counts: dict[str, int] = {}
+
+    # Per-player: kills, deaths, games, topfrag count, bottomfrag count
+    player_stats: dict[str, dict] = {}
+
+    for m in matches:
+        s_ct, s_t = m["score_ct"], m["score_t"]
+        if s_ct == s_t:
+            ties += 1
+        elif s_ct > s_t:
+            # Can't determine which "side" tracked players were on from recap;
+            # we count the match result by majority tracked-player side
+            # Simple approach: call it a win if top-score is CT (matches are from CT pov in title)
+            wins += 1
+        else:
+            losses += 1
+
+        map_name = m["map"]
+        map_counts[map_name] = map_counts.get(map_name, 0) + 1
+
+        players = m["players"]
+        if not players:
+            continue
+
+        # Only count tracked players for leaderboard
+        tracked_in_match = [
+            p for p in players
+            if any(p["name"].rstrip("⭐").strip() == name for name in TRACKED_PLAYERS.values())
+               or p["name"].rstrip("⭐").strip() in TRACKED_PLAYERS.values()
+        ]
+        if not tracked_in_match:
+            # Fall back: include everyone found in the embed
+            tracked_in_match = players
+
+        top_kills     = max(p["kills"] for p in tracked_in_match)
+        bottom_kills  = min(p["kills"] for p in tracked_in_match)
+
+        for p in tracked_in_match:
+            n = p["name"].rstrip("⭐").strip()
+            if n not in player_stats:
+                player_stats[n] = {"kills": 0, "deaths": 0, "games": 0, "topfrags": 0, "bottomfrags": 0}
+            player_stats[n]["kills"]  += p["kills"]
+            player_stats[n]["deaths"] += p["deaths"]
+            player_stats[n]["games"]  += 1
+            if p["kills"] == top_kills:
+                player_stats[n]["topfrags"] += 1
+            if p["kills"] == bottom_kills:
+                player_stats[n]["bottomfrags"] += 1
+
+    # ── Build embed ─────────────────────────────────────────────────
+    week_label = f"{week_ago.strftime('%b %d')} – {now.strftime('%b %d, %Y')}"
+    embed = discord.Embed(
+        title=f"📅 Weekly Recap — {week_label}",
+        color=discord.Color.og_blurple()
+    )
+
+    # Overall record
+    embed.add_field(
+        name="🎮 Games Played",
+        value=f"**{total}** total  ·  ✅ {wins}W  ❌ {losses}L  ➖ {ties}T",
+        inline=False
+    )
+
+    # Maps played
+    if map_counts:
+        sorted_maps = sorted(map_counts.items(), key=lambda x: x[1], reverse=True)
+        map_parts   = [f"**{name}** ×{count}" for name, count in sorted_maps]
+        embed.add_field(name="🗺️ Maps Played", value="  ·  ".join(map_parts), inline=False)
+
+    # Kill leaderboard
+    if player_stats:
+        sorted_players = sorted(
+            player_stats.items(),
+            key=lambda x: x[1]["kills"],
+            reverse=True
+        )
+
+        lb_lines = ["`{:<16} {:>5} {:>6}`".format("PLAYER", "KILLS", "GAMES")]
+        medals   = ["🥇", "🥈", "🥉"]
+        for i, (name, s) in enumerate(sorted_players):
+            prefix = medals[i] if i < 3 else "  "
+            lb_lines.append("`{:<16} {:>5} {:>6}`".format(
+                name[:16], s["kills"], f"({s['games']}g)"
+            ))
+            if i < 3:
+                # Prepend medal outside the code block
+                lb_lines[-1] = prefix + " " + lb_lines[-1]
+
+        embed.add_field(name="🔫 Kill Leaderboard", value="\n".join(lb_lines), inline=False)
+
+        # Top & bottom fragger
+        top_fragger    = max(player_stats.items(), key=lambda x: x[1]["topfrags"])
+        bottom_fragger = max(player_stats.items(), key=lambda x: x[1]["bottomfrags"])
+
+        embed.add_field(
+            name="👑 Most Top Frags",
+            value=f"**{top_fragger[0]}** ({top_fragger[1]['topfrags']}×)",
+            inline=True
+        )
+        embed.add_field(
+            name="💀 Most Bottom Frags",
+            value=f"**{bottom_fragger[0]}** ({bottom_fragger[1]['bottomfrags']}×)",
+            inline=True
+        )
+
+    embed.set_footer(text=f"Based on {total} match{'es' if total != 1 else ''} tracked this week")
+    return embed
+
+
+@tasks.loop(minutes=1)
+async def weekly_recap_task():
+    """Posts weekly recap every Sunday at 21:00 UTC."""
+    now = datetime.now(timezone.utc)
+    if now.weekday() != 6:          # 6 = Sunday
+        return
+    if not (now.hour == 21 and now.minute == 0):
+        return
+
+    for guild in bot.guilds:
+        channel = discord.utils.get(guild.text_channels, name="leetify")
+        if not channel:
+            continue
+        try:
+            embed = await build_weekly_recap(channel)
+            if embed:
+                await channel.send(embed=embed)
+            else:
+                await channel.send("📅 Weekly recap: no matches tracked this week.")
+        except Exception as e:
+            print(f"[weekly_recap_task] {guild.name}: {e}")
+
+
+# =================================================================
+# 10. COMMANDS
 # =================================================================
 
 @bot.command(name="addplayer")
@@ -730,8 +951,25 @@ async def stats_command(ctx, steam_id: str):
         embeds = build_profile_embeds(data, steam_id, profile_matches)
         await ctx.reply(embeds=embeds)
 
+@bot.command(name="weeklyrecap")
+async def force_weekly_recap(ctx):
+    """!weeklyrecap — manually trigger the weekly recap in the #leetify channel (for testing)"""
+    leetify_channel = discord.utils.get(ctx.guild.text_channels, name="leetify")
+    if not leetify_channel:
+        await ctx.send("❌ No `#leetify` channel found in this server.")
+        return
+    async with ctx.typing():
+        embed = await build_weekly_recap(leetify_channel)
+        if embed:
+            await leetify_channel.send(embed=embed)
+            if ctx.channel != leetify_channel:
+                await ctx.send(f"✅ Weekly recap posted in {leetify_channel.mention}.")
+        else:
+            await ctx.send("📅 No matches found in `#leetify` from the past 7 days.")
+
+
 # =================================================================
-# 10. ON READY
+# 11. ON READY
 # =================================================================
 
 @bot.event
@@ -742,9 +980,10 @@ async def on_ready():
     print(f"📋 Loaded {len(TRACKED_PLAYERS)} tracked player(s) from Supabase.")
     check_leetify_stats.start()
     reset_poll_at_3am.start()
+    weekly_recap_task.start()
 
 # =================================================================
-# 11. RUN
+# 12. RUN
 # =================================================================
 
 keep_alive()
