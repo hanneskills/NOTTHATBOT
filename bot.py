@@ -744,11 +744,13 @@ async def build_weekly_recap(channel: discord.TextChannel) -> discord.Embed | No
     and returns a Weekly Recap embed.
     """
     now      = datetime.now(timezone.utc)
-    week_ago = now - timedelta(days=7)
+    # Start of the current week = most recent Monday at 00:00 UTC
+    days_since_monday = now.weekday()  # Monday=0, Sunday=6
+    week_start = (now - timedelta(days=days_since_monday)).replace(hour=0, minute=0, second=0, microsecond=0)
 
     matches = []  # list of parsed match dicts
 
-    async for message in channel.history(after=week_ago, limit=2000, oldest_first=False):
+    async for message in channel.history(after=week_start, limit=2000, oldest_first=False):
         if message.author != bot.user:
             continue
         for embed in message.embeds:
@@ -845,7 +847,7 @@ async def build_weekly_recap(channel: discord.TextChannel) -> discord.Embed | No
                     player_stats[n]["bottomfrags"] += 1
 
     # ── Build embed ─────────────────────────────────────────────────
-    week_label = f"{week_ago.strftime('%b %d')} – {now.strftime('%b %d, %Y')}"
+    week_label = f"{week_start.strftime('%b %d')} – {now.strftime('%b %d, %Y')}"
     embed = discord.Embed(
         title=f"📅 Weekly Recap — {week_label}",
         color=discord.Color.og_blurple()
@@ -854,7 +856,7 @@ async def build_weekly_recap(channel: discord.TextChannel) -> discord.Embed | No
     # Overall record
     embed.add_field(
         name="🎮 Games Played",
-        value=f"**{total}**",
+        value=f"**{total}** — {wins}W / {ties}T / {losses}L",
         inline=False
     )
 
@@ -901,11 +903,11 @@ async def build_weekly_recap(channel: discord.TextChannel) -> discord.Embed | No
 
 @tasks.loop(minutes=1)
 async def weekly_recap_task():
-    """Posts weekly recap every Sunday at 21:00 UTC."""
+    """Posts weekly recap every Sunday at 22:00 UTC (midnight Belgian time)."""
     now = datetime.now(timezone.utc)
     if now.weekday() != 6:          # 6 = Sunday
         return
-    if not (now.hour == 21 and now.minute == 0):
+    if not (now.hour == 22 and now.minute == 0):
         return
 
     for guild in bot.guilds:
@@ -1023,7 +1025,7 @@ async def force_weekly_recap(ctx):
             if ctx.channel != leetify_channel:
                 await ctx.send(f"✅ Weekly recap posted in {leetify_channel.mention}.")
         else:
-            await ctx.send("📅 No matches found in `#leetify` from the past 7 days.")
+            await ctx.send("📅 No matches found in `#leetify` since the start of this week.")
 
 
 # =================================================================
