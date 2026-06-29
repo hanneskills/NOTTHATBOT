@@ -552,7 +552,7 @@ def build_match_embed(match_data: dict) -> discord.Embed | None:
         # Find which team number the majority of tracked players were on.
         all_stats = sorted(
             match_data.get("stats", []),
-            key=lambda p: p.get("leetify_rating", 0) or 0,
+            key=lambda p: p.get("total_kills", 0) or 0,
             reverse=True
         )
         tracked_teams = [
@@ -856,7 +856,7 @@ async def build_weekly_recap(channel: discord.TextChannel) -> discord.Embed | No
     # Overall record
     embed.add_field(
         name="🎮 Games Played",
-        value=f"**{total}** — {wins}W / {ties}T / {losses}L",
+        value=f"**{total}** — ✅ {wins}W / ➖ {ties}T / ❌ {losses}L",
         inline=False
     )
 
