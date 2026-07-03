@@ -990,6 +990,33 @@ async def last_match(ctx, steam_id: str):
     else:
         await ctx.send("Could not parse match data.")
 
+@bot.command(name="getmatch")
+async def get_match(ctx, match_id: str):
+    """!getmatch <matchid or leetify url> — force-post a specific match (e.g. one that
+    didn't get auto-posted, like a match uploaded right after a faceit game) to #leetify"""
+    leetify_channel = discord.utils.get(ctx.guild.text_channels, name="leetify")
+    if not leetify_channel:
+        await ctx.send("❌ No `#leetify` channel found in this server.")
+        return
+
+    # Allow pasting a full https://leetify.com/app/match-details/<id> link too
+    url_match = re.search(r'match-details/([a-zA-Z0-9\-]+)', match_id)
+    if url_match:
+        match_id = url_match.group(1)
+
+    async with ctx.typing():
+        match_data = fetch_full_match(match_id)
+        if not match_data:
+            await ctx.send(f"❌ Could not fetch match `{match_id}`. Double check the match ID.")
+            return
+        embed = build_match_embed(match_data)
+        if not embed:
+            await ctx.send("❌ Could not parse match data.")
+            return
+        await leetify_channel.send(embed=embed)
+        if ctx.channel != leetify_channel:
+            await ctx.send(f"✅ Match posted in {leetify_channel.mention}.")
+
 @bot.command(name="stats")
 async def stats_command(ctx, steam_id: str):
     """!stats <steam64id> — show profile stat card"""
