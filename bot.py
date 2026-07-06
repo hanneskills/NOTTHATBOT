@@ -263,6 +263,12 @@ LEETIFY_API_KEY  = os.environ.get('LEETIFY_API_KEY')
 LEETIFY_HEADERS  = {"_leetify_key": LEETIFY_API_KEY} if LEETIFY_API_KEY else {}
 LEETIFY_BASE     = "https://api-public.cs-prod.leetify.com"
 
+# Channel names used throughout the Leetify integration.
+# Match scoreboards (auto-posted + !getmatch) still go to LEETIFY_CHANNEL_NAME.
+# The weekly leaderboard/recap is posted to WEEKLY_CHANNEL_NAME instead.
+LEETIFY_CHANNEL_NAME = "leetify"
+WEEKLY_CHANNEL_NAME   = "weekly"
+
 STEAM_API_KEY    = os.environ.get('STEAM_API_KEY')  # Needed for custom URL resolution
 
 STEAMID64_RE     = re.compile(r'\b(7656119\d{10})\b')
@@ -625,6 +631,27 @@ def build_match_embed(match_data: dict) -> discord.Embed | None:
         return None
 
 
+async def match_already_posted(channel: discord.TextChannel, match_id: str, lookback_days: int = 30) -> bool:
+    """
+    Checks whether a scoreboard for this match has already been posted in `channel`,
+    by scanning recent bot messages for an embed containing this match's Leetify link.
+    Used to stop the same match from being posted twice — whether that's an accidental
+    double automatic post, or someone running !getmatch on a match that's already up.
+    """
+    match_link = f"leetify.com/app/match-details/{match_id}"
+    try:
+        after = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+        async for message in channel.history(after=after, limit=1000, oldest_first=False):
+            if message.author != bot.user:
+                continue
+            for embed in message.embeds:
+                if embed.description and match_link in embed.description:
+                    return True
+    except Exception as e:
+        print(f"[match_already_posted] {e}")
+    return False
+
+
 @tasks.loop(minutes=2)
 async def check_leetify_stats():
     if not LEETIFY_API_KEY or not TRACKED_PLAYERS:
@@ -661,8 +688,11 @@ async def check_leetify_stats():
                         embed = build_match_embed(match_data)
                         if embed:
                             for guild in bot.guilds:
-                                channel = discord.utils.get(guild.text_channels, name="leetify")
+                                channel = discord.utils.get(guild.text_channels, name=LEETIFY_CHANNEL_NAME)
                                 if channel:
+                                    if await match_already_posted(channel, latest_id):
+                                        print(f"[check_leetify_stats] Skipping duplicate post for match {latest_id}.")
+                                        continue
                                     await channel.send(embed=embed)
 
         except Exception as e:
@@ -911,15 +941,18 @@ async def weekly_recap_task():
         return
 
     for guild in bot.guilds:
-        channel = discord.utils.get(guild.text_channels, name="leetify")
-        if not channel:
+        leetify_channel = discord.utils.get(guild.text_channels, name=LEETIFY_CHANNEL_NAME)
+        weekly_channel  = discord.utils.get(guild.text_channels, name=WEEKLY_CHANNEL_NAME)
+        if not leetify_channel or not weekly_channel:
             continue
         try:
-            embed = await build_weekly_recap(channel)
+            # Matches are scraped from #leetify (where scoreboards get posted),
+            # but the resulting recap embed is posted to #weekly.
+            embed = await build_weekly_recap(leetify_channel)
             if embed:
-                await channel.send(embed=embed)
+                await weekly_channel.send(embed=embed)
             else:
-                await channel.send("📅 Weekly recap: no matches tracked this week.")
+                await weekly_channel.send("📅 Weekly recap: no matches tracked this week.")
         except Exception as e:
             print(f"[weekly_recap_task] {guild.name}: {e}")
 
@@ -994,7 +1027,7 @@ async def last_match(ctx, steam_id: str):
 async def get_match(ctx, match_id: str):
     """!getmatch <matchid or leetify url> — force-post a specific match (e.g. one that
     didn't get auto-posted, like a match uploaded right after a faceit game) to #leetify"""
-    leetify_channel = discord.utils.get(ctx.guild.text_channels, name="leetify")
+    leetify_channel = discord.utils.get(ctx.guild.text_channels, name=LEETIFY_CHANNEL_NAME)
     if not leetify_channel:
         await ctx.send("❌ No `#leetify` channel found in this server.")
         return
@@ -1005,6 +1038,9 @@ async def get_match(ctx, match_id: str):
         match_id = url_match.group(1)
 
     async with ctx.typing():
+        if await match_already_posted(leetify_channel, match_id):
+            await ctx.send(f"⚠️ That match has already been posted in {leetify_channel.mention} — skipping.")
+            return
         match_data = fetch_full_match(match_id)
         if not match_data:
             await ctx.send(f"❌ Could not fetch match `{match_id}`. Double check the match ID.")
@@ -1040,17 +1076,21 @@ async def stats_command(ctx, steam_id: str):
 
 @bot.command(name="weeklyrecap")
 async def force_weekly_recap(ctx):
-    """!weeklyrecap — manually trigger the weekly recap in the #leetify channel (for testing)"""
-    leetify_channel = discord.utils.get(ctx.guild.text_channels, name="leetify")
+    """!weeklyrecap — manually trigger the weekly recap, posted in the #weekly channel (for testing)"""
+    leetify_channel = discord.utils.get(ctx.guild.text_channels, name=LEETIFY_CHANNEL_NAME)
+    weekly_channel  = discord.utils.get(ctx.guild.text_channels, name=WEEKLY_CHANNEL_NAME)
     if not leetify_channel:
         await ctx.send("❌ No `#leetify` channel found in this server.")
+        return
+    if not weekly_channel:
+        await ctx.send("❌ No `#weekly` channel found in this server.")
         return
     async with ctx.typing():
         embed = await build_weekly_recap(leetify_channel)
         if embed:
-            await leetify_channel.send(embed=embed)
-            if ctx.channel != leetify_channel:
-                await ctx.send(f"✅ Weekly recap posted in {leetify_channel.mention}.")
+            await weekly_channel.send(embed=embed)
+            if ctx.channel != weekly_channel:
+                await ctx.send(f"✅ Weekly recap posted in {weekly_channel.mention}.")
         else:
             await ctx.send("📅 No matches found in `#leetify` since the start of this week.")
 
