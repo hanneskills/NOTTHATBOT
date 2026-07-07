@@ -1,5 +1,6 @@
 import os
 import re
+import asyncio
 import discord
 import requests
 from discord.ext import commands, tasks
@@ -480,7 +481,7 @@ async def handle_steamid_lookup(message):
         steam_id = url_match.group(1)
     elif custom_match:
         vanity = custom_match.group(1)
-        steam_id = resolve_vanity_url(vanity)
+        steam_id = await asyncio.to_thread(resolve_vanity_url, vanity)
         if not steam_id:
             if not STEAM_API_KEY:
                 await message.reply(
@@ -501,7 +502,7 @@ async def handle_steamid_lookup(message):
         return
 
     async with message.channel.typing():
-        data = fetch_profile(steam_id)
+        data = await asyncio.to_thread(fetch_profile, steam_id)
         if not data:
             # NOTE: As of April 2026, Leetify's public API only returns data for
             # registered users. Unregistered players DO have stats tracked internally
@@ -519,7 +520,7 @@ async def handle_steamid_lookup(message):
             )
             return
 
-        profile_matches = fetch_profile_matches(steam_id)
+        profile_matches = await asyncio.to_thread(fetch_profile_matches, steam_id)
         embeds = build_profile_embeds(data, steam_id, profile_matches)
         await message.reply(embeds=embeds)
 
@@ -661,7 +662,8 @@ async def check_leetify_stats():
 
     for steam_id in list(TRACKED_PLAYERS.keys()):
         try:
-            res = requests.get(
+            res = await asyncio.to_thread(
+                requests.get,
                 f"{LEETIFY_BASE}/v3/profile/matches",
                 headers=LEETIFY_HEADERS,
                 params={"steam64_id": steam_id},
@@ -683,7 +685,7 @@ async def check_leetify_stats():
                 last_seen_matches[steam_id] = latest_id
                 if latest_id not in seen_this_tick:
                     seen_this_tick.add(latest_id)
-                    match_data = fetch_full_match(latest_id)
+                    match_data = await asyncio.to_thread(fetch_full_match, latest_id)
                     if match_data:
                         embed = build_match_embed(match_data)
                         if embed:
@@ -968,7 +970,7 @@ async def add_player(ctx, steam_id: str, *, display_name: str):
         await ctx.send("❌ Invalid Steam64 ID (17 digits starting with 7656119...).")
         return
     TRACKED_PLAYERS[steam_id] = display_name
-    ok = db_add_player(steam_id, display_name)
+    ok = await asyncio.to_thread(db_add_player, steam_id, display_name)
     if ok:
         await ctx.send(f"✅ Now tracking **{display_name}** (`{steam_id}`).")
     else:
@@ -981,7 +983,7 @@ async def remove_player(ctx, steam_id: str):
         await ctx.send("That Steam ID isn't being tracked.")
         return
     name = TRACKED_PLAYERS.pop(steam_id)
-    ok = db_remove_player(steam_id)
+    ok = await asyncio.to_thread(db_remove_player, steam_id)
     if ok:
         await ctx.send(f"🗑️ Removed **{name}** from tracking.")
     else:
@@ -999,7 +1001,8 @@ async def list_players(ctx):
 @bot.command(name="lastmatch")
 async def last_match(ctx, steam_id: str):
     """!lastmatch <steam64id> — force-post the most recent match"""
-    res = requests.get(
+    res = await asyncio.to_thread(
+        requests.get,
         f"{LEETIFY_BASE}/v3/profile/matches",
         headers=LEETIFY_HEADERS,
         params={"steam64_id": steam_id},
@@ -1013,7 +1016,7 @@ async def last_match(ctx, steam_id: str):
         await ctx.send("No matches found.")
         return
     match_id   = matches[0].get("id")
-    match_data = fetch_full_match(match_id)
+    match_data = await asyncio.to_thread(fetch_full_match, match_id)
     if not match_data:
         await ctx.send("Could not fetch full match data.")
         return
@@ -1041,7 +1044,7 @@ async def get_match(ctx, match_id: str):
         if await match_already_posted(leetify_channel, match_id):
             await ctx.send(f"⚠️ That match has already been posted in {leetify_channel.mention} — skipping.")
             return
-        match_data = fetch_full_match(match_id)
+        match_data = await asyncio.to_thread(fetch_full_match, match_id)
         if not match_data:
             await ctx.send(f"❌ Could not fetch match `{match_id}`. Double check the match ID.")
             return
@@ -1063,14 +1066,14 @@ async def stats_command(ctx, steam_id: str):
         await ctx.send("⚠️ `LEETIFY_API_KEY` is not set.")
         return
     async with ctx.typing():
-        data = fetch_profile(steam_id)
+        data = await asyncio.to_thread(fetch_profile, steam_id)
         if not data:
             await ctx.reply(
                 f"❌ No Leetify data for `{steam_id}`.\n"
                 "ℹ️ This player may not be registered on Leetify — the public API only returns stats for registered users."
             )
             return
-        profile_matches = fetch_profile_matches(steam_id)
+        profile_matches = await asyncio.to_thread(fetch_profile_matches, steam_id)
         embeds = build_profile_embeds(data, steam_id, profile_matches)
         await ctx.reply(embeds=embeds)
 
@@ -1103,7 +1106,7 @@ async def force_weekly_recap(ctx):
 async def on_ready():
     global TRACKED_PLAYERS
     print(f"✅ Logged in as {bot.user}")
-    TRACKED_PLAYERS = db_load_tracked()
+    TRACKED_PLAYERS = await asyncio.to_thread(db_load_tracked)
     print(f"📋 Loaded {len(TRACKED_PLAYERS)} tracked player(s) from Supabase.")
     check_leetify_stats.start()
     reset_poll_at_3am.start()
