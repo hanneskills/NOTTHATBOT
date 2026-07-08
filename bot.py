@@ -839,10 +839,23 @@ def parse_match_embed(embed: discord.Embed) -> dict | None:
         return None
 
 
-async def build_weekly_recap(channel: discord.TextChannel) -> discord.Embed | None:
+def _pad(text: str, width: int) -> str:
+    """Left-align/truncate text to a fixed width for monospace tables."""
+    text = str(text)
+    if len(text) > width:
+        return text[: width - 1] + "…"
+    return text.ljust(width)
+
+
+def _rpad(text: str, width: int) -> str:
+    """Right-align text to a fixed width for monospace tables."""
+    return str(text).rjust(width)
+
+
+async def build_weekly_recap(channel: discord.TextChannel) -> list[discord.Embed] | None:
     """
     Scrapes the last 7 days of messages in `channel`, extracts bot match embeds,
-    and returns a Weekly Recap embed.
+    and returns a list of Weekly Recap embeds: [maps_embed, kills_embed, frags_embed].
     """
     now      = datetime.now(timezone.utc)
     # Start of the current week = most recent Monday at 00:00 UTC
@@ -868,8 +881,8 @@ async def build_weekly_recap(channel: discord.TextChannel) -> discord.Embed | No
     losses  = 0
     ties    = 0
 
-    # Map play counts
-    map_counts: dict[str, int] = {}
+    # Map stats: count / wins / losses / ties per map
+    map_stats: dict[str, dict] = {}
 
     # Per-player: kills, deaths, games, topfrag count, bottomfrag count
     # topfrag  = highest rating on their team that game
@@ -884,15 +897,20 @@ async def build_weekly_recap(channel: discord.TextChannel) -> discord.Embed | No
         # title is always "CT X : Y T" from the perspective of the match, so whichever
         # side has the higher score won. We track the match result as a single event
         # (one win or one loss for the group) using whichever side scored more.
+        map_name = m["map"]
+        if map_name not in map_stats:
+            map_stats[map_name] = {"count": 0, "wins": 0, "losses": 0, "ties": 0}
+        map_stats[map_name]["count"] += 1
+
         if s_ct == s_t:
             ties += 1
+            map_stats[map_name]["ties"] += 1
         elif s_ct > s_t:
             wins += 1
+            map_stats[map_name]["wins"] += 1
         else:
             losses += 1
-
-        map_name = m["map"]
-        map_counts[map_name] = map_counts.get(map_name, 0) + 1
+            map_stats[map_name]["losses"] += 1
 
         players = m["players"]
         if not players:
@@ -947,59 +965,106 @@ async def build_weekly_recap(channel: discord.TextChannel) -> discord.Embed | No
                 if r is not None and r == worst_rating:
                     player_stats[n]["bottomfrags"] += 1
 
-    # ── Build embed ─────────────────────────────────────────────────
+    # ── Build embeds ────────────────────────────────────────────────
     week_label = f"{week_start.strftime('%b %d')} – {now.strftime('%b %d, %Y')}"
-    embed = discord.Embed(
+    footer_text = f"Based on {total} match{'es' if total != 1 else ''} tracked this week"
+
+    # ── Message 1: Maps ───────────────────────────────────────────
+    maps_embed = discord.Embed(
         title=f"📅 Weekly Recap — {week_label}",
         color=discord.Color.og_blurple()
     )
-
-    # Overall record
-    embed.add_field(
+    maps_embed.add_field(
         name="🎮 Games Played",
         value=f"**{total}** — ✅ {wins}W / ➖ {ties}T / ❌ {losses}L",
         inline=False
     )
 
-    # Maps played — vertical list sorted by count desc
-    if map_counts:
-        sorted_maps = sorted(map_counts.items(), key=lambda x: x[1], reverse=True)
-        map_lines   = [f"**{name}** ×{count}" for name, count in sorted_maps]
-        embed.add_field(name="🗺️ Maps Played", value="\n".join(map_lines), inline=False)
+    if map_stats:
+        sorted_maps = sorted(map_stats.items(), key=lambda x: x[1]["count"], reverse=True)
 
-    # Kill leaderboard — no medals, no (g) suffix
+        header = f"`{_pad('MAP', 14)}{_rpad('PLAYED', 7)}{_rpad('W-L-T', 9)}{_rpad('WIN%', 6)}`"
+        map_lines = [header]
+        for name, s in sorted_maps:
+            decisive = s["wins"] + s["losses"]
+            win_pct  = f"{round(s['wins'] / decisive * 100)}%" if decisive > 0 else "-"
+            record   = f"{s['wins']}-{s['losses']}-{s['ties']}"
+            map_lines.append(
+                f"`{_pad(name, 14)}{_rpad(s['count'], 7)}{_rpad(record, 9)}{_rpad(win_pct, 6)}`"
+            )
+
+        maps_embed.add_field(name="🗺️ Maps Played", value="\n".join(map_lines), inline=False)
+
+    maps_embed.set_footer(text=footer_text)
+
+    embeds = [maps_embed]
+
     if player_stats:
-        sorted_players = sorted(
+        # ── Message 2: Kill leaderboard ────────────────────────────
+        kills_embed = discord.Embed(
+            title="🔫 Weekly Kill Leaderboard",
+            color=discord.Color.red()
+        )
+
+        sorted_by_kills = sorted(
             player_stats.items(),
             key=lambda x: x[1]["kills"],
             reverse=True
         )
 
-        lb_lines = ["`{:<16} {:>5} {:>5}`".format("PLAYER", "KILLS", "GAMES")]
-        for name, s in sorted_players:
-            lb_lines.append("`{:<16} {:>5} {:>5}`".format(
-                name[:16], s["kills"], s["games"]
-            ))
+        header = f"`{_pad('PLAYER', 16)}{_rpad('KILLS', 6)}{_rpad('GAMES', 6)}{_rpad('K/G', 6)}`"
+        lb_lines = [header]
+        for name, s in sorted_by_kills:
+            kpg = f"{s['kills'] / s['games']:.1f}" if s["games"] > 0 else "0.0"
+            lb_lines.append(
+                f"`{_pad(name, 16)}{_rpad(s['kills'], 6)}{_rpad(s['games'], 6)}{_rpad(kpg, 6)}`"
+            )
 
-        embed.add_field(name="🔫 Kill Leaderboard", value="\n".join(lb_lines), inline=False)
+        kills_embed.add_field(name="Kills — most to least", value="\n".join(lb_lines), inline=False)
+        kills_embed.set_footer(text=footer_text)
+        embeds.append(kills_embed)
 
-        # Top & bottom fragger (most times highest/lowest rated on their team)
-        top_fragger    = max(player_stats.items(), key=lambda x: x[1]["topfrags"])
-        bottom_fragger = max(player_stats.items(), key=lambda x: x[1]["bottomfrags"])
-
-        embed.add_field(
-            name="👑 Most Top Frags",
-            value=f"**{top_fragger[0]}** ({top_fragger[1]['topfrags']}×)",
-            inline=True
-        )
-        embed.add_field(
-            name="💀 Most Bottom Frags",
-            value=f"**{bottom_fragger[0]}** ({bottom_fragger[1]['bottomfrags']}×)",
-            inline=True
+        # ── Message 3: Top / bottom frag leaderboard ───────────────
+        frags_embed = discord.Embed(
+            title="🎯 Top & Bottom Frags",
+            color=discord.Color.gold()
         )
 
-    embed.set_footer(text=f"Based on {total} match{'es' if total != 1 else ''} tracked this week")
-    return embed
+        sorted_top = sorted(
+            (p for p in player_stats.items() if p[1]["topfrags"] > 0),
+            key=lambda x: x[1]["topfrags"],
+            reverse=True
+        )
+        sorted_bottom = sorted(
+            (p for p in player_stats.items() if p[1]["bottomfrags"] > 0),
+            key=lambda x: x[1]["bottomfrags"],
+            reverse=True
+        )
+
+        if sorted_top:
+            header = f"`{_pad('PLAYER', 16)}{_rpad('×', 4)}{_rpad('GAMES', 6)}{_rpad('%', 5)}`"
+            top_lines = [header]
+            for name, s in sorted_top:
+                pct = f"{round(s['topfrags'] / s['games'] * 100)}%" if s["games"] > 0 else "-"
+                top_lines.append(
+                    f"`{_pad(name, 16)}{_rpad(s['topfrags'], 4)}{_rpad(s['games'], 6)}{_rpad(pct, 5)}`"
+                )
+            frags_embed.add_field(name="👑 Most Top Frags", value="\n".join(top_lines), inline=False)
+
+        if sorted_bottom:
+            header = f"`{_pad('PLAYER', 16)}{_rpad('×', 4)}{_rpad('GAMES', 6)}{_rpad('%', 5)}`"
+            bottom_lines = [header]
+            for name, s in sorted_bottom:
+                pct = f"{round(s['bottomfrags'] / s['games'] * 100)}%" if s["games"] > 0 else "-"
+                bottom_lines.append(
+                    f"`{_pad(name, 16)}{_rpad(s['bottomfrags'], 4)}{_rpad(s['games'], 6)}{_rpad(pct, 5)}`"
+                )
+            frags_embed.add_field(name="💀 Most Bottom Frags", value="\n".join(bottom_lines), inline=False)
+
+        frags_embed.set_footer(text=footer_text)
+        embeds.append(frags_embed)
+
+    return embeds
 
 
 @tasks.loop(minutes=1)
@@ -1018,10 +1083,11 @@ async def weekly_recap_task():
             continue
         try:
             # Matches are scraped from #leetify (where scoreboards get posted),
-            # but the resulting recap embed is posted to #weekly.
-            embed = await build_weekly_recap(leetify_channel)
-            if embed:
-                await weekly_channel.send(embed=embed)
+            # but the resulting recap embeds are posted to #weekly.
+            embeds = await build_weekly_recap(leetify_channel)
+            if embeds:
+                for e in embeds:
+                    await weekly_channel.send(embed=e)
             else:
                 await weekly_channel.send("📅 Weekly recap: no matches tracked this week.")
         except Exception as e:
@@ -1180,9 +1246,10 @@ async def force_weekly_recap(ctx):
         await ctx.send("❌ No `#weekly` channel found in this server.")
         return
     async with ctx.typing():
-        embed = await build_weekly_recap(leetify_channel)
-        if embed:
-            await weekly_channel.send(embed=embed)
+        embeds = await build_weekly_recap(leetify_channel)
+        if embeds:
+            for e in embeds:
+                await weekly_channel.send(embed=e)
             if ctx.channel != weekly_channel:
                 await ctx.send(f"✅ Weekly recap posted in {weekly_channel.mention}.")
         else:
