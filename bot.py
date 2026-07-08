@@ -701,6 +701,75 @@ async def check_leetify_stats():
             print(f"[check_leetify_stats] {steam_id}: {e}")
 
 
+MAX_CATCHUP_MATCHES_PER_PLAYER = 15
+
+async def catch_up_missed_matches(guild: discord.Guild, max_per_player: int = MAX_CATCHUP_MATCHES_PER_PLAYER) -> int:
+    """
+    Scans each tracked player's recent Leetify matches (this includes Faceit games,
+    since Leetify syncs those in automatically) and posts any that are missing from
+    #leetify — e.g. matches that happened while the bot was offline, or matches that
+    never got auto-announced for some other reason.
+
+    Dedupes match IDs across players (since one match usually involves several tracked
+    players), checks each against channel history via match_already_posted(), and posts
+    anything missing oldest-first so the channel stays in chronological order.
+
+    Also rebaselines last_seen_matches to each player's current latest match, so the
+    periodic check_leetify_stats loop doesn't try to re-announce something we just
+    caught up on.
+
+    Returns the number of matches posted.
+    """
+    leetify_channel = discord.utils.get(guild.text_channels, name=LEETIFY_CHANNEL_NAME)
+    if not leetify_channel or not TRACKED_PLAYERS or not LEETIFY_API_KEY:
+        return 0
+
+    candidates = {}          # match_id -> finished_at timestamp (for sort order)
+    latest_per_player = {}   # steam_id -> most recent match_id seen this run
+
+    for steam_id in list(TRACKED_PLAYERS.keys()):
+        try:
+            matches = await asyncio.to_thread(fetch_profile_matches, steam_id)
+        except Exception as e:
+            print(f"[catch_up_missed_matches] fetch {steam_id}: {e}")
+            continue
+        if not matches:
+            continue
+
+        latest_per_player[steam_id] = matches[0].get("id")
+        for m in matches[:max_per_player]:
+            mid = m.get("id")
+            if not mid:
+                continue
+            candidates[mid] = m.get("finished_at") or m.get("game_finished_at") or ""
+
+    if not candidates:
+        return 0
+
+    posted = 0
+    for mid in sorted(candidates, key=lambda i: candidates[i]):
+        try:
+            if await match_already_posted(leetify_channel, mid):
+                continue
+            match_data = await asyncio.to_thread(fetch_full_match, mid)
+            if not match_data:
+                continue
+            embed = build_match_embed(match_data)
+            if not embed:
+                continue
+            await leetify_channel.send(embed=embed)
+            posted += 1
+        except Exception as e:
+            print(f"[catch_up_missed_matches] {mid}: {e}")
+
+    # Rebaseline so the periodic checker treats these as already handled.
+    for steam_id, mid in latest_per_player.items():
+        if mid:
+            last_seen_matches[steam_id] = mid
+
+    return posted
+
+
 # =================================================================
 # 9. WEEKLY RECAP (Sunday 21:00 UTC)
 # =================================================================
@@ -1077,6 +1146,28 @@ async def stats_command(ctx, steam_id: str):
         embeds = build_profile_embeds(data, steam_id, profile_matches)
         await ctx.reply(embeds=embeds)
 
+@bot.command(name="catchup")
+async def catchup_command(ctx):
+    """!catchup — check every tracked player's recent matches (including Faceit games
+    synced through Leetify) and post any that are missing from #leetify, e.g. games
+    that happened while the bot was down."""
+    if not LEETIFY_API_KEY:
+        await ctx.send("⚠️ `LEETIFY_API_KEY` is not set.")
+        return
+    if not TRACKED_PLAYERS:
+        await ctx.send("No players tracked yet. Use `!addplayer <steam64id> <name>`.")
+        return
+    leetify_channel = discord.utils.get(ctx.guild.text_channels, name=LEETIFY_CHANNEL_NAME)
+    if not leetify_channel:
+        await ctx.send("❌ No `#leetify` channel found in this server.")
+        return
+    async with ctx.typing():
+        posted = await catch_up_missed_matches(ctx.guild)
+    if posted:
+        await ctx.send(f"✅ Caught up — posted {posted} missing match{'es' if posted != 1 else ''} in {leetify_channel.mention}.")
+    else:
+        await ctx.send("👍 Nothing missing — all recent matches are already posted.")
+
 @bot.command(name="weeklyrecap")
 async def force_weekly_recap(ctx):
     """!weeklyrecap — manually trigger the weekly recap, posted in the #weekly channel (for testing)"""
@@ -1108,6 +1199,17 @@ async def on_ready():
     print(f"✅ Logged in as {bot.user}")
     TRACKED_PLAYERS = await asyncio.to_thread(db_load_tracked)
     print(f"📋 Loaded {len(TRACKED_PLAYERS)} tracked player(s) from Supabase.")
+
+    # Catch up on any matches (including Faceit games) that happened while the
+    # bot was offline, before starting the regular periodic checker.
+    for guild in bot.guilds:
+        try:
+            posted = await catch_up_missed_matches(guild)
+            if posted:
+                print(f"[catch_up_missed_matches] Posted {posted} missed match(es) in {guild.name}.")
+        except Exception as e:
+            print(f"[catch_up_missed_matches] {guild.name}: {e}")
+
     check_leetify_stats.start()
     reset_poll_at_3am.start()
     weekly_recap_task.start()
