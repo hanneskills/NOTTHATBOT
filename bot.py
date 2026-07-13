@@ -134,6 +134,14 @@ def sanitize_display_name(name: str, fallback: str = NAME_SANITIZE_FALLBACK) -> 
         # Cc = control characters. Both can break table alignment silently.
         if unicodedata.category(ch) in ("Cf", "Cc"):
             return fallback
+        # Wide/fullwidth script (CJK, etc.). The Unicode standard treats these
+        # as exactly double-width, but Discord's actual font doesn't render
+        # them at a perfectly clean 2x — there's a small per-character rounding
+        # error that's invisible on 1-2 characters but compounds into a visible
+        # drift over a full name. Since that can't be reliably corrected for,
+        # names using it get swapped out instead of risking misalignment.
+        if unicodedata.east_asian_width(ch) in ("W", "F"):
+            return fallback
 
     return name
 
