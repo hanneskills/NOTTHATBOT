@@ -1,4 +1,4 @@
-# CS2 Squad Bot 🎮
+# CS2 purpose-built discord bot
 
 A Discord bot for CS2 (Counter-Strike 2) groups that automates game night sign-ups and turns your server into a live scoreboard for everyone's matches. It watches for tracked players' games via [Leetify](https://leetify.com), posts clean match embeds automatically, and runs a weekly recap of who's been grinding.
 
