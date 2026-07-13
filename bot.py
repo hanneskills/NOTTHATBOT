@@ -941,19 +941,41 @@ def _rpad(text: str, width: int) -> str:
     return rpad_visual(text, width)
 
 
-async def build_weekly_recap(channel: discord.TextChannel) -> list[discord.Embed] | None:
+async def build_weekly_recap(channel: discord.TextChannel, weeks_ago: int = 0) -> list[discord.Embed] | None:
     """
-    Scrapes the last 7 days of messages in `channel`, extracts bot match embeds,
-    and returns a list of Weekly Recap embeds: [maps_embed, kills_embed, frags_embed].
+    Scrapes messages in `channel` for one week's worth of bot match embeds, and
+    returns a list of Weekly Recap embeds: [maps_embed, kills_embed, frags_embed].
+
+    weeks_ago=0  -> the current (in-progress) week: most recent Monday 00:00 UTC
+                    through right now.
+    weeks_ago=1  -> last week: the Monday 00:00 UTC before that, through the
+                    following Sunday 23:59:59 UTC (i.e. the midnight that starts
+                    the next Monday).
+    weeks_ago=2,3,... -> further back, one full week at a time.
     """
-    now      = datetime.now(timezone.utc)
-    # Start of the current week = most recent Monday at 00:00 UTC
+    now = datetime.now(timezone.utc)
+    # Start of the CURRENT week = most recent Monday at 00:00 UTC
     days_since_monday = now.weekday()  # Monday=0, Sunday=6
-    week_start = (now - timedelta(days=days_since_monday)).replace(hour=0, minute=0, second=0, microsecond=0)
+    this_week_start = (now - timedelta(days=days_since_monday)).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    # Shift back by however many full weeks we want to look at.
+    week_start = this_week_start - timedelta(weeks=weeks_ago)
+
+    if weeks_ago == 0:
+        # Current week is still in progress — end the range "now" like before.
+        week_end = now
+    else:
+        # A completed past week: Monday 00:00 UTC through the following
+        # Monday 00:00 UTC (exclusive), i.e. up to Sunday midnight.
+        week_end = week_start + timedelta(days=7)
 
     matches = []  # list of parsed match dicts
 
-    async for message in channel.history(after=week_start, limit=2000, oldest_first=False):
+    history_kwargs = {"after": week_start, "limit": 2000, "oldest_first": False}
+    if weeks_ago != 0:
+        history_kwargs["before"] = week_end
+
+    async for message in channel.history(**history_kwargs):
         if message.author != bot.user:
             continue
         for embed in message.embeds:
@@ -974,8 +996,8 @@ async def build_weekly_recap(channel: discord.TextChannel) -> list[discord.Embed
     map_stats: dict[str, dict] = {}
 
     # Per-player: kills, deaths, games, topfrag count, bottomfrag count
-    # topfrag  = highest rating on their team that game
-    # bottomfrag = lowest rating on their team that game
+    # topfrag  = most kills on their team that game
+    # bottomfrag = fewest kills on their team that game
     player_stats: dict[str, dict] = {}
 
     for m in matches:
@@ -1014,32 +1036,26 @@ async def build_weekly_recap(channel: discord.TextChannel) -> list[discord.Embed
         if not tracked_in_match:
             tracked_in_match = players
 
-        # Top/bottom frag is determined per team by Leetify rating (as shown in embed).
-        # The embed already has CT players and T players in separate fields with their
-        # own sort order (highest rating first). We reconstruct that here by grouping
-        # tracked players by the field they came from, stored as "team" in parse step.
-        # Since we don't store team info, we approximate: split by index into two halves
-        # (CT first, T second) based on how parse_match_embed iterates fields.
-        # More precisely: parse_match_embed appends CT players then T players in order,
-        # and within each side they're already sorted by rating desc (build_match_embed
-        # sorts all_stats by leetify_rating desc). So the first tracked player per side
-        # is the topfrag and the last is the bottomfrag of that side.
-        # We use the "team" field added in parse_match_embed for this.
+        # Top/bottom frag is determined per team by kills (the classic "top frag"
+        # meaning — most kills on your side that game). The embed already has CT
+        # players and T players in separate fields; we reconstruct that here using
+        # the "team" field added in parse_match_embed.
         for team_label in ("CT", "T"):
             # Full team (everyone on this side, tracked or not) — used to find the
-            # actual best/worst rating on the team so we don't falsely award top/bottomfrag
-            # to a tracked player who merely has the best/worst rating among tracked players.
+            # actual highest/lowest kills on the team so we don't falsely award
+            # topfrag/bottomfrag to a tracked player who merely has the best/worst
+            # kills among tracked players.
             full_team    = [p for p in players if p.get("team") == team_label]
             team_players = [p for p in tracked_in_match if p.get("team") == team_label]
             if not team_players or not full_team:
                 continue
 
-            # Best/worst rating across the ENTIRE team (all 5 players)
-            full_ratings = [p.get("rating") for p in full_team if p.get("rating") is not None]
-            if not full_ratings:
+            # Most/fewest kills across the ENTIRE team (all 5 players)
+            full_kills = [p.get("kills") for p in full_team if p.get("kills") is not None]
+            if not full_kills:
                 continue
-            best_rating  = max(full_ratings)
-            worst_rating = min(full_ratings)
+            most_kills   = max(full_kills)
+            fewest_kills = min(full_kills)
 
             for p in team_players:
                 n = p["name"].rstrip("⭐").strip()
@@ -1048,15 +1064,25 @@ async def build_weekly_recap(channel: discord.TextChannel) -> list[discord.Embed
                 player_stats[n]["kills"]  += p["kills"]
                 player_stats[n]["deaths"] += p["deaths"]
                 player_stats[n]["games"]  += 1
-                r = p.get("rating")
-                if r is not None and r == best_rating:
+                k = p.get("kills")
+                if k is not None and k == most_kills:
                     player_stats[n]["topfrags"] += 1
-                if r is not None and r == worst_rating:
+                if k is not None and k == fewest_kills:
                     player_stats[n]["bottomfrags"] += 1
 
     # ── Build embeds ────────────────────────────────────────────────
-    week_label = f"{week_start.strftime('%b %d')} – {now.strftime('%b %d, %Y')}"
-    footer_text = f"Based on {total} match{'es' if total != 1 else ''} tracked this week"
+    # For a completed week, week_end is the *next* Monday 00:00 UTC — display
+    # the Sunday date it actually ended on instead of that following Monday.
+    label_end_dt = now if weeks_ago == 0 else (week_end - timedelta(days=1))
+    week_label = f"{week_start.strftime('%b %d')} – {label_end_dt.strftime('%b %d, %Y')}"
+
+    if weeks_ago == 0:
+        when_text = "this week"
+    elif weeks_ago == 1:
+        when_text = "last week"
+    else:
+        when_text = f"{weeks_ago} weeks ago"
+    footer_text = f"Based on {total} match{'es' if total != 1 else ''} tracked {when_text}"
 
     # ── Message 1: Maps ───────────────────────────────────────────
     maps_embed = discord.Embed(
@@ -1351,8 +1377,15 @@ async def catchup_command(ctx):
         await ctx.send("👍 Nothing missing — all recent matches are already posted.")
 
 @bot.command(name="weeklyrecap")
-async def force_weekly_recap(ctx):
-    """!weeklyrecap — manually trigger the weekly recap, posted in the #weekly channel (for testing)"""
+async def force_weekly_recap(ctx, weeks_ago: int = 0):
+    """!weeklyrecap [N] — manually trigger the weekly recap, posted in the #weekly channel.
+    With no argument, recaps the current (in-progress) week — same as before.
+    !weeklyrecap 1 -> last week, !weeklyrecap 2 -> the week before that, !weeklyrecap 3 -> the
+    week before that one. Each past week runs Monday 00:00 UTC through the following Sunday
+    24:00 UTC (i.e. the midnight that starts the next Monday)."""
+    if weeks_ago < 0:
+        await ctx.send("❌ Weeks back can't be negative — use `!weeklyrecap`, `!weeklyrecap 1`, `!weeklyrecap 2`, etc.")
+        return
     leetify_channel = discord.utils.get(ctx.guild.text_channels, name=LEETIFY_CHANNEL_NAME)
     weekly_channel  = discord.utils.get(ctx.guild.text_channels, name=WEEKLY_CHANNEL_NAME)
     if not leetify_channel:
@@ -1361,15 +1394,21 @@ async def force_weekly_recap(ctx):
     if not weekly_channel:
         await ctx.send("❌ No `#weekly` channel found in this server.")
         return
+    if weeks_ago == 0:
+        when_text = "this week"
+    elif weeks_ago == 1:
+        when_text = "last week"
+    else:
+        when_text = f"{weeks_ago} weeks ago"
     async with ctx.typing():
-        embeds = await build_weekly_recap(leetify_channel)
+        embeds = await build_weekly_recap(leetify_channel, weeks_ago=weeks_ago)
         if embeds:
             for e in embeds:
                 await weekly_channel.send(embed=e)
             if ctx.channel != weekly_channel:
-                await ctx.send(f"✅ Weekly recap posted in {weekly_channel.mention}.")
+                await ctx.send(f"✅ Weekly recap ({when_text}) posted in {weekly_channel.mention}.")
         else:
-            await ctx.send("📅 No matches found in `#leetify` since the start of this week.")
+            await ctx.send(f"📅 No matches found in `#leetify` for {when_text}.")
 
 
 # =================================================================
