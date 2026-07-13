@@ -1,5 +1,6 @@
 import os
 import re
+import unicodedata
 import asyncio
 import discord
 import requests
@@ -97,6 +98,45 @@ def db_remove_player(steam_id):
     except Exception as e:
         print(f"[Supabase] db_remove_player error: {e}")
         return False
+
+# =================================================================
+# 3.5 NAME SANITIZATION
+# =================================================================
+# Player names come from Steam/Leetify and are user-controlled, so they can
+# contain characters that break Discord's monospace scoreboard tables:
+#   - backticks (`) close the code block early and mangle everything after it
+#   - right-to-left script (Arabic, Hebrew, etc.) flips the visual direction
+#     of the whole row instead of just the name
+#   - zero-width / control characters can silently corrupt the layout too
+# Rather than trying to escape these, we just swap the whole name out for a
+# neutral placeholder — trying to keep *part* of the name isn't worth the
+# risk of missing an edge case.
+
+NAME_SANITIZE_FALLBACK = "John Doe"
+
+def sanitize_display_name(name: str, fallback: str = NAME_SANITIZE_FALLBACK) -> str:
+    """Returns `name` unchanged if it's safe to embed in a Discord monospace
+    table, otherwise returns `fallback`."""
+    if not name:
+        return fallback
+
+    # Backticks (regular + fullwidth) end a ``` / ` code block early.
+    if "`" in name or "\uFF40" in name:
+        return fallback
+
+    for ch in name:
+        bidi = unicodedata.bidirectional(ch)
+        # R/AL = right-to-left letters (Arabic, Hebrew, ...); RLE/RLO/RLI/PDI/
+        # LRI/FSI are explicit bidi-control characters that can flip direction.
+        if bidi in ("R", "AL", "RLE", "RLO", "RLI", "PDI", "LRI", "FSI"):
+            return fallback
+        # Cf = invisible "format" characters (zero-width joiners, etc.),
+        # Cc = control characters. Both can break table alignment silently.
+        if unicodedata.category(ch) in ("Cf", "Cc"):
+            return fallback
+
+    return name
+
 
 # =================================================================
 # 4. POLL HELPERS
@@ -356,7 +396,7 @@ def build_profile_embeds(data: dict, steam_id: str, profile_matches: list | None
     """
     embeds = []
 
-    name         = data.get("name", steam_id)
+    name         = sanitize_display_name(data.get("name", steam_id))
     rating       = data.get("rating", {})
     stats        = data.get("stats", {})
     ranks        = data.get("ranks", {})
@@ -606,8 +646,17 @@ def build_match_embed(match_data: dict) -> discord.Embed | None:
             for p in players:
                 sid        = str(p.get("steam64_id", ""))
                 is_tracked = sid in TRACKED_PLAYERS
-                name       = TRACKED_PLAYERS.get(sid) or p.get("name") or sid
-                display    = (name[:13] + "⭐" if is_tracked else name[:14]).ljust(16)
+                name       = sanitize_display_name(TRACKED_PLAYERS.get(sid) or p.get("name") or sid)
+                if is_tracked:
+                    # Discord's monospace font renders ⭐ about 2 columns wide even
+                    # though it's a single character, so padding to the same target
+                    # width as a starless name (16) overshoots by one column and
+                    # shifts every stat after it to the right. Padding to 15 instead
+                    # (16 minus the star's extra visual column) keeps both rows
+                    # lining up at the same true visual width.
+                    display = (name[:13] + "⭐").ljust(15)
+                else:
+                    display = name[:14].ljust(16)
                 k      = p.get("total_kills", 0)
                 d      = p.get("total_deaths", 0)
                 damage = p.get("total_damage", 0)
@@ -1190,6 +1239,33 @@ async def get_match(ctx, match_id: str):
         await leetify_channel.send(embed=embed)
         if ctx.channel != leetify_channel:
             await ctx.send(f"✅ Match posted in {leetify_channel.mention}.")
+
+@bot.command(name="testgetmatch")
+async def test_get_match(ctx, match_id: str):
+    """!testgetmatch <matchid or leetify url> — TEST ONLY. Same as !getmatch but
+    skips the 'already posted?' check, so you can re-post the same match repeatedly
+    while testing embed formatting changes."""
+    leetify_channel = discord.utils.get(ctx.guild.text_channels, name=LEETIFY_CHANNEL_NAME)
+    if not leetify_channel:
+        await ctx.send("❌ No `#leetify` channel found in this server.")
+        return
+
+    url_match = re.search(r'match-details/([a-zA-Z0-9\-]+)', match_id)
+    if url_match:
+        match_id = url_match.group(1)
+
+    async with ctx.typing():
+        match_data = await asyncio.to_thread(fetch_full_match, match_id)
+        if not match_data:
+            await ctx.send(f"❌ Could not fetch match `{match_id}`. Double check the match ID.")
+            return
+        embed = build_match_embed(match_data)
+        if not embed:
+            await ctx.send("❌ Could not parse match data.")
+            return
+        await leetify_channel.send(embed=embed)
+        if ctx.channel != leetify_channel:
+            await ctx.send(f"✅ [TEST] Match posted in {leetify_channel.mention} (duplicate check skipped).")
 
 @bot.command(name="stats")
 async def stats_command(ctx, steam_id: str):
