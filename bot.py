@@ -138,6 +138,45 @@ def sanitize_display_name(name: str, fallback: str = NAME_SANITIZE_FALLBACK) -> 
     return name
 
 
+# ── Visual-width-aware padding ─────────────────────────────────────
+# Discord's monospace font renders CJK characters (Japanese/Chinese/Korean)
+# and most emoji roughly TWICE as wide as a Latin character, even though
+# each is still just one Python character. Padding/truncating by len()
+# assumes 1 character = 1 column, so any name containing a wide character
+# (or the ⭐ tracked-player marker) throws every column after it out of
+# alignment. These helpers pad/truncate by rendered column width instead,
+# so a table's stat columns always start at the same horizontal position
+# no matter what's in the name.
+
+def _char_visual_width(ch: str) -> int:
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+def _visual_width(text: str) -> int:
+    return sum(_char_visual_width(ch) for ch in text)
+
+def pad_visual(text: str, width: int, ellipsis: bool = False) -> str:
+    """Left-align `text` to exactly `width` visual columns, truncating on
+    overflow (optionally with a trailing '…')."""
+    text = str(text)
+    reserve = 1 if (ellipsis and _visual_width(text) > width) else 0
+    out, w = "", 0
+    for ch in text:
+        cw = _char_visual_width(ch)
+        if w + cw > width - reserve:
+            break
+        out += ch
+        w += cw
+    if reserve:
+        out += "…"
+        w += 1
+    return out + " " * (width - w)
+
+def rpad_visual(text: str, width: int) -> str:
+    """Right-align text to a fixed visual width for monospace tables."""
+    text = str(text)
+    return " " * max(0, width - _visual_width(text)) + text
+
+
 # =================================================================
 # 4. POLL HELPERS
 # =================================================================
@@ -647,16 +686,10 @@ def build_match_embed(match_data: dict) -> discord.Embed | None:
                 sid        = str(p.get("steam64_id", ""))
                 is_tracked = sid in TRACKED_PLAYERS
                 name       = sanitize_display_name(TRACKED_PLAYERS.get(sid) or p.get("name") or sid)
-                if is_tracked:
-                    # Discord's monospace font renders ⭐ about 2 columns wide even
-                    # though it's a single character, so padding to the same target
-                    # width as a starless name (16) overshoots by one column and
-                    # shifts every stat after it to the right. Padding to 15 instead
-                    # (16 minus the star's extra visual column) keeps both rows
-                    # lining up at the same true visual width.
-                    display = (name[:13] + "⭐").ljust(15)
-                else:
-                    display = name[:14].ljust(16)
+                # pad_visual accounts for the ⭐ marker and any wide (CJK) characters
+                # rendering ~2 columns wide, so the stats always start at column 17
+                # regardless of what the name looks like.
+                display = pad_visual(name + ("⭐" if is_tracked else ""), 16)
                 k      = p.get("total_kills", 0)
                 d      = p.get("total_deaths", 0)
                 damage = p.get("total_damage", 0)
@@ -665,7 +698,7 @@ def build_match_embed(match_data: dict) -> discord.Embed | None:
                 rating = p.get("leetify_rating", None)
                 hs_pct = round((p.get("total_hs_kills", 0) / k * 100)) if k else 0
                 rtg    = f"{rating * 100:.1f}" if rating is not None else "—"
-                lines.append("`{:<16} {:>3} {:>3} {:>5} {:>3}% {:>8}`".format(
+                lines.append("`{} {:>3} {:>3} {:>5} {:>3}% {:>8}`".format(
                     display, k, d, adr, hs_pct, rtg
                 ))
             return "\n".join(lines)
@@ -889,16 +922,15 @@ def parse_match_embed(embed: discord.Embed) -> dict | None:
 
 
 def _pad(text: str, width: int) -> str:
-    """Left-align/truncate text to a fixed width for monospace tables."""
-    text = str(text)
-    if len(text) > width:
-        return text[: width - 1] + "…"
-    return text.ljust(width)
+    """Left-align/truncate text to a fixed *visual* width for monospace tables.
+    Delegates to pad_visual so CJK names pulled from parsed embeds don't drift
+    out of alignment the same way the scoreboard used to."""
+    return pad_visual(text, width, ellipsis=True)
 
 
 def _rpad(text: str, width: int) -> str:
-    """Right-align text to a fixed width for monospace tables."""
-    return str(text).rjust(width)
+    """Right-align text to a fixed visual width for monospace tables."""
+    return rpad_visual(text, width)
 
 
 async def build_weekly_recap(channel: discord.TextChannel) -> list[discord.Embed] | None:
