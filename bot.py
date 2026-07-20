@@ -644,9 +644,14 @@ def build_match_embed(match_data: dict) -> discord.Embed | None:
 
         # Determine result from tracked players' perspective.
         # Find which team number the majority of tracked players were on.
+        def _player_adr(p):
+            rounds = p.get("rounds_count", 1) or 1
+            return (p.get("total_damage", 0) or 0) / rounds
+
+        # Sorted by kills, then by ADR as a tiebreaker (higher ADR ranks higher).
         all_stats = sorted(
             match_data.get("stats", []),
-            key=lambda p: p.get("total_kills", 0) or 0,
+            key=lambda p: (p.get("total_kills", 0) or 0, _player_adr(p)),
             reverse=True
         )
         tracked_teams = [
@@ -905,6 +910,8 @@ def parse_match_embed(embed: discord.Embed) -> dict | None:
                 try:
                     rtg_str = parts[-1]
                     rating  = float(rtg_str) if rtg_str != "—" else None
+                    adr_str = parts[-3]
+                    adr     = float(adr_str) if adr_str != "—" else 0.0
                     deaths  = int(parts[-4])
                     kills   = int(parts[-5])
                     name    = " ".join(parts[:-5]).rstrip("⭐").strip()
@@ -912,6 +919,7 @@ def parse_match_embed(embed: discord.Embed) -> dict | None:
                         "name":   name,
                         "kills":  kills,
                         "deaths": deaths,
+                        "adr":    adr,
                         "rating": rating,   # already ×100 (displayed value)
                         "team":   team_label,
                     })
@@ -1060,10 +1068,11 @@ async def build_weekly_recap(channel: discord.TextChannel, weeks_ago: int = 0) -
             for p in team_players:
                 n = p["name"].rstrip("⭐").strip()
                 if n not in player_stats:
-                    player_stats[n] = {"kills": 0, "deaths": 0, "games": 0, "topfrags": 0, "bottomfrags": 0}
-                player_stats[n]["kills"]  += p["kills"]
-                player_stats[n]["deaths"] += p["deaths"]
-                player_stats[n]["games"]  += 1
+                    player_stats[n] = {"kills": 0, "deaths": 0, "games": 0, "topfrags": 0, "bottomfrags": 0, "adr_sum": 0.0}
+                player_stats[n]["kills"]   += p["kills"]
+                player_stats[n]["deaths"]  += p["deaths"]
+                player_stats[n]["games"]   += 1
+                player_stats[n]["adr_sum"] += p.get("adr", 0.0)
                 k = p.get("kills")
                 if k is not None and k == most_kills:
                     player_stats[n]["topfrags"] += 1
@@ -1121,9 +1130,10 @@ async def build_weekly_recap(channel: discord.TextChannel, weeks_ago: int = 0) -
             color=discord.Color.red()
         )
 
+        # Sorted by kills, then by average ADR as a tiebreaker (higher ADR wins ties)
         sorted_by_kills = sorted(
             player_stats.items(),
-            key=lambda x: x[1]["kills"],
+            key=lambda x: (x[1]["kills"], x[1]["adr_sum"] / x[1]["games"] if x[1]["games"] else 0),
             reverse=True
         )
 
@@ -1145,14 +1155,18 @@ async def build_weekly_recap(channel: discord.TextChannel, weeks_ago: int = 0) -
             color=discord.Color.gold()
         )
 
+        def _avg_adr(s):
+            return s["adr_sum"] / s["games"] if s["games"] else 0
+
+        # Ties broken by average ADR — higher ADR ranks higher in both lists.
         sorted_top = sorted(
             (p for p in player_stats.items() if p[1]["topfrags"] > 0),
-            key=lambda x: x[1]["topfrags"],
+            key=lambda x: (x[1]["topfrags"], _avg_adr(x[1])),
             reverse=True
         )
         sorted_bottom = sorted(
             (p for p in player_stats.items() if p[1]["bottomfrags"] > 0),
-            key=lambda x: x[1]["bottomfrags"],
+            key=lambda x: (x[1]["bottomfrags"], _avg_adr(x[1])),
             reverse=True
         )
 
