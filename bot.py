@@ -191,15 +191,35 @@ def rpad_visual(text: str, width: int) -> str:
 
 def parse_time_offset(text):
     """
-    Looks for 'in 2 hours', 'in 20 minutes', 'in 1.5 hours'.
+    Looks for 'in 2 hours', 'in 20 minutes', 'in 1.5 hours', 'in 1h30m',
+    'in 1 hour 30 minutes', etc.
+    Recognizes hour units: h, hr, hrs, hour, hours
+    Recognizes minute units: m, min, mins, minute, minutes
     Returns a UTC datetime if found, else None.
     """
-    match = re.search(r'in\s+(\d+(?:\.\d+)?)\s*(hour|hr|minute|min)s?', text.lower())
+    text = text.lower()
+    hour_unit   = r'h(?:r|rs|our|ours)?'
+    minute_unit = r'm(?:in|ins|inute|inutes)?'
+
+    # Both hours and minutes given together, e.g. "in 1h30m" / "in 1 hour 30 min"
+    # (uses a negative lookahead instead of \b since "h" immediately followed by a
+    # digit, like in "1h30m", isn't a \b word boundary)
+    combined = re.search(
+        rf'in\s+(\d+(?:\.\d+)?)\s*{hour_unit}(?![a-z])\s*(?:and\s*)?(\d+(?:\.\d+)?)\s*{minute_unit}(?![a-z])',
+        text
+    )
+    if combined:
+        hours   = float(combined.group(1))
+        minutes = float(combined.group(2))
+        return datetime.now(timezone.utc) + timedelta(hours=hours, minutes=minutes)
+
+    # Just one unit given
+    match = re.search(rf'in\s+(\d+(?:\.\d+)?)\s*({hour_unit}|{minute_unit})(?![a-z])', text)
     if not match:
         return None
     amount = float(match.group(1))
     unit   = match.group(2)
-    delta  = timedelta(hours=amount) if unit in ("hour", "hr") else timedelta(minutes=amount)
+    delta  = timedelta(hours=amount) if unit.startswith("h") else timedelta(minutes=amount)
     return datetime.now(timezone.utc) + delta
 
 
@@ -262,8 +282,8 @@ async def handle_game_signups(message):
     if message.channel.name != SIGNUP_CHANNEL:
         return
 
-    content = message.content.lower()
-    if not ("game" in content or "playing" in content):
+    # Only create a poll when the bot itself is pinged/mentioned.
+    if bot.user not in message.mentions:
         return
 
     # Detect optional time
