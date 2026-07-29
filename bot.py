@@ -969,6 +969,31 @@ def _rpad(text: str, width: int) -> str:
     return rpad_visual(text, width)
 
 
+def _join_capped(lines: list[str], limit: int = 1024) -> str:
+    """Join table lines for an embed field, staying under Discord's per-field
+    character limit (1024). If the full table would overflow, keep the
+    header plus as many rows as fit and append a '+N more' note instead of
+    letting the overflow raise an HTTPException on send (which would silently
+    abort the rest of the weekly recap messages)."""
+    joined = "\n".join(lines)
+    if len(joined) <= limit:
+        return joined
+
+    header, *rows = lines
+    kept = [header]
+    # Reserve room for a trailing "+N more" note.
+    note_reserve = 20
+    total = len(header)
+    for i, row in enumerate(rows):
+        if total + len(row) + 1 + note_reserve > limit:
+            remaining = len(rows) - i
+            kept.append(f"… +{remaining} more")
+            break
+        kept.append(row)
+        total += len(row) + 1
+    return "\n".join(kept)
+
+
 async def build_weekly_recap(channel: discord.TextChannel, weeks_ago: int = 0) -> list[discord.Embed] | None:
     """
     Scrapes messages in `channel` for one week's worth of bot match embeds, and
@@ -1055,14 +1080,21 @@ async def build_weekly_recap(channel: discord.TextChannel, weeks_ago: int = 0) -
         if not players:
             continue
 
-        # Only count tracked players for leaderboard
+        # Only count tracked players for leaderboard. If none of THIS match's
+        # players are currently tracked (e.g. everyone in it was removed from
+        # tracking, or it was a solo/duo game with people outside the group),
+        # skip the match for leaderboard purposes rather than falling back to
+        # counting every player in it — that fallback used to dump entire
+        # enemy teams of strangers into the kill/frag leaderboards, which
+        # could blow past Discord's 1024-char embed field limit and cause
+        # the kills/frags messages to silently fail to send.
         tracked_names = set(TRACKED_PLAYERS.values())
         tracked_in_match = [
             p for p in players
             if p["name"].rstrip("⭐").strip() in tracked_names
         ]
         if not tracked_in_match:
-            tracked_in_match = players
+            continue
 
         # Top/bottom frag is determined per team by kills (the classic "top frag"
         # meaning — most kills on your side that game). The embed already has CT
@@ -1137,7 +1169,7 @@ async def build_weekly_recap(channel: discord.TextChannel, weeks_ago: int = 0) -
                 f"`{_pad(name, 14)}{_rpad(s['count'], 7)}{_rpad(record, 9)}{_rpad(win_pct, 6)}`"
             )
 
-        maps_embed.add_field(name="🗺️ Maps Played", value="\n".join(map_lines), inline=False)
+        maps_embed.add_field(name="🗺️ Maps Played", value=_join_capped(map_lines), inline=False)
 
     maps_embed.set_footer(text=footer_text)
 
@@ -1165,7 +1197,7 @@ async def build_weekly_recap(channel: discord.TextChannel, weeks_ago: int = 0) -
                 f"`{_pad(name, 16)}{_rpad(s['kills'], 6)}{_rpad(s['games'], 6)}{_rpad(kpg, 6)}`"
             )
 
-        kills_embed.add_field(name="Kills — most to least", value="\n".join(lb_lines), inline=False)
+        kills_embed.add_field(name="Kills — most to least", value=_join_capped(lb_lines), inline=False)
         kills_embed.set_footer(text=footer_text)
         embeds.append(kills_embed)
 
@@ -1198,7 +1230,7 @@ async def build_weekly_recap(channel: discord.TextChannel, weeks_ago: int = 0) -
                 top_lines.append(
                     f"`{_pad(name, 16)}{_rpad(s['topfrags'], 4)}{_rpad(s['games'], 6)}{_rpad(pct, 5)}`"
                 )
-            frags_embed.add_field(name="👑 Most Top Frags", value="\n".join(top_lines), inline=False)
+            frags_embed.add_field(name="👑 Most Top Frags", value=_join_capped(top_lines), inline=False)
 
         if sorted_bottom:
             header = f"`{_pad('PLAYER', 16)}{_rpad('×', 4)}{_rpad('GAMES', 6)}{_rpad('%', 5)}`"
@@ -1208,7 +1240,7 @@ async def build_weekly_recap(channel: discord.TextChannel, weeks_ago: int = 0) -
                 bottom_lines.append(
                     f"`{_pad(name, 16)}{_rpad(s['bottomfrags'], 4)}{_rpad(s['games'], 6)}{_rpad(pct, 5)}`"
                 )
-            frags_embed.add_field(name="💀 Most Bottom Frags", value="\n".join(bottom_lines), inline=False)
+            frags_embed.add_field(name="💀 Most Bottom Frags", value=_join_capped(bottom_lines), inline=False)
 
         frags_embed.set_footer(text=footer_text)
         embeds.append(frags_embed)
@@ -1235,8 +1267,15 @@ async def weekly_recap_task():
             # but the resulting recap embeds are posted to #weekly.
             embeds = await build_weekly_recap(leetify_channel)
             if embeds:
-                for e in embeds:
-                    await weekly_channel.send(embed=e)
+                for i, e in enumerate(embeds):
+                    try:
+                        await weekly_channel.send(embed=e)
+                    except discord.HTTPException as send_err:
+                        print(f"[weekly_recap_task] {guild.name}: failed to send embed {i+1}/{len(embeds)}: {send_err}")
+                        await weekly_channel.send(
+                            f"⚠️ Weekly recap: one of the recap messages ({i+1}/{len(embeds)}) failed to send — {send_err}"
+                        )
+                        break
             else:
                 await weekly_channel.send("📅 Weekly recap: no matches tracked this week.")
         except Exception as e:
@@ -1437,8 +1476,16 @@ async def force_weekly_recap(ctx, weeks_ago: int = 0):
     async with ctx.typing():
         embeds = await build_weekly_recap(leetify_channel, weeks_ago=weeks_ago)
         if embeds:
+            sent = 0
             for e in embeds:
-                await weekly_channel.send(embed=e)
+                try:
+                    await weekly_channel.send(embed=e)
+                    sent += 1
+                except discord.HTTPException as send_err:
+                    await ctx.send(
+                        f"⚠️ Sent {sent}/{len(embeds)} recap message(s), then one failed to send — `{send_err}`"
+                    )
+                    return
             if ctx.channel != weekly_channel:
                 await ctx.send(f"✅ Weekly recap ({when_text}) posted in {weekly_channel.mention}.")
         else:
