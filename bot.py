@@ -63,25 +63,40 @@ def get_supabase_headers():
     }
 
 def db_load_tracked():
+    """Returns (tracked_players, player_discord_ids, player_rank_bracket) — three dicts
+    keyed by steam_id, loaded in one round trip."""
     try:
         res = requests.get(
-            f"{SUPABASE_URL}/rest/v1/tracked_players?select=steam_id,display_name",
+            f"{SUPABASE_URL}/rest/v1/tracked_players?select=steam_id,display_name,discord_user_id,rank_bracket",
             headers=get_supabase_headers(), timeout=10
         )
         if res.status_code == 200:
-            return {row["steam_id"]: row["display_name"] for row in res.json()}
+            rows = res.json()
+            tracked = {row["steam_id"]: row["display_name"] for row in rows}
+            discord_ids = {
+                row["steam_id"]: int(row["discord_user_id"])
+                for row in rows if row.get("discord_user_id")
+            }
+            rank_brackets = {
+                row["steam_id"]: row["rank_bracket"]
+                for row in rows if row.get("rank_bracket")
+            }
+            return tracked, discord_ids, rank_brackets
         print(f"[Supabase] Failed to load: {res.status_code} {res.text}")
-        return {}
+        return {}, {}, {}
     except Exception as e:
         print(f"[Supabase] db_load_tracked error: {e}")
-        return {}
+        return {}, {}, {}
 
-def db_add_player(steam_id, display_name):
+def db_add_player(steam_id, display_name, discord_user_id=None):
     try:
+        payload = {"steam_id": steam_id, "display_name": display_name}
+        if discord_user_id is not None:
+            payload["discord_user_id"] = str(discord_user_id)
         res = requests.post(
             f"{SUPABASE_URL}/rest/v1/tracked_players",
             headers={**get_supabase_headers(), "Prefer": "resolution=merge-duplicates"},
-            json={"steam_id": steam_id, "display_name": display_name}, timeout=10
+            json=payload, timeout=10
         )
         return res.status_code in (200, 201)
     except Exception as e:
@@ -97,6 +112,30 @@ def db_remove_player(steam_id):
         return res.status_code in (200, 204)
     except Exception as e:
         print(f"[Supabase] db_remove_player error: {e}")
+        return False
+
+def db_link_discord(steam_id, discord_user_id):
+    try:
+        res = requests.patch(
+            f"{SUPABASE_URL}/rest/v1/tracked_players?steam_id=eq.{steam_id}",
+            headers=get_supabase_headers(),
+            json={"discord_user_id": str(discord_user_id)}, timeout=10
+        )
+        return res.status_code in (200, 204)
+    except Exception as e:
+        print(f"[Supabase] db_link_discord error: {e}")
+        return False
+
+def db_update_rank_bracket(steam_id, bracket):
+    try:
+        res = requests.patch(
+            f"{SUPABASE_URL}/rest/v1/tracked_players?steam_id=eq.{steam_id}",
+            headers=get_supabase_headers(),
+            json={"rank_bracket": bracket}, timeout=10
+        )
+        return res.status_code in (200, 204)
+    except Exception as e:
+        print(f"[Supabase] db_update_rank_bracket error: {e}")
         return False
 
 # =================================================================
@@ -385,6 +424,31 @@ STEAM_CUSTOM_RE  = re.compile(r'steamcommunity\.com/id/([^/\s?]+)')
 last_seen_matches = {}
 TRACKED_PLAYERS   = {}
 
+# Discord role-per-rank-bracket state
+PLAYER_DISCORD_IDS  = {}   # steam_id -> discord_user_id
+PLAYER_RANK_BRACKET = {}   # steam_id -> last-assigned bracket string
+
+# Bracket thresholds used for the auto-assigned Discord rank roles. These are
+# intentionally coarser than PREMIER_RANKS (which drives the !stats label) —
+# this is a role-per-tier system, not a display label.
+RANK_BRACKETS = [
+    (5000,  "0-5k"),
+    (10000, "5-10k"),
+    (15000, "10-15k"),
+    (20000, "15-20k"),
+    (25000, "20-25k"),
+    (30000, "25-30k"),
+]
+RANK_ROLE_NAMES = [b[1] for b in RANK_BRACKETS] + ["30k+", "unranked"]
+
+def get_rank_bracket(premier_rating: int | None) -> str:
+    if not premier_rating or premier_rating <= 0:
+        return "unranked"
+    for threshold, label in RANK_BRACKETS:
+        if premier_rating < threshold:
+            return label
+    return "30k+"
+
 
 def resolve_vanity_url(vanity_name: str) -> str | None:
     """
@@ -453,6 +517,34 @@ def fetch_profile_matches(steam_id: str) -> list | None:
     except Exception as e:
         print(f"[fetch_profile_matches] {e}")
         return None
+
+
+async def update_rank_role(guild: discord.Guild, steam_id: str, new_bracket: str):
+    """Assigns `new_bracket`'s Discord role to the linked member, removing any other
+    bracket role they're holding. No-ops if the player has no linked Discord account
+    or isn't a member of this guild."""
+    discord_id = PLAYER_DISCORD_IDS.get(steam_id)
+    if not discord_id:
+        return
+
+    member = guild.get_member(discord_id)
+    if not member:
+        return
+
+    try:
+        for role in list(member.roles):
+            if role.name in RANK_ROLE_NAMES and role.name != new_bracket:
+                await member.remove_roles(role)
+
+        target_role = discord.utils.get(guild.roles, name=new_bracket)
+        if target_role is None:
+            target_role = await guild.create_role(name=new_bracket)
+        if target_role not in member.roles:
+            await member.add_roles(target_role)
+    except discord.Forbidden:
+        print(f"[update_rank_role] Missing permissions to manage roles for {member} in {guild.name}.")
+    except Exception as e:
+        print(f"[update_rank_role] {steam_id}: {e}")
 
 
 def build_profile_embeds(data: dict, steam_id: str, profile_matches: list | None = None) -> list[discord.Embed]:
@@ -811,6 +903,18 @@ async def check_leetify_stats():
                                         print(f"[check_leetify_stats] Skipping duplicate post for match {latest_id}.")
                                         continue
                                     await channel.send(embed=embed)
+
+                # A new match landed — re-check the player's current rating and
+                # update their rank-bracket Discord role if it moved.
+                if steam_id in PLAYER_DISCORD_IDS:
+                    profile = await asyncio.to_thread(fetch_profile, steam_id)
+                    new_rating  = (profile or {}).get("ranks", {}).get("premier", 0)
+                    new_bracket = get_rank_bracket(new_rating)
+                    if PLAYER_RANK_BRACKET.get(steam_id) != new_bracket:
+                        PLAYER_RANK_BRACKET[steam_id] = new_bracket
+                        await asyncio.to_thread(db_update_rank_bracket, steam_id, new_bracket)
+                        for guild in bot.guilds:
+                            await update_rank_role(guild, steam_id, new_bracket)
 
         except Exception as e:
             print(f"[check_leetify_stats] {steam_id}: {e}")
@@ -1287,17 +1391,50 @@ async def weekly_recap_task():
 # =================================================================
 
 @bot.command(name="addplayer")
-async def add_player(ctx, steam_id: str, *, display_name: str):
-    """!addplayer <steam64id> <display name>"""
+async def add_player(ctx, steam_id: str, discord_user: discord.Member = None, *, display_name: str = None):
+    """!addplayer <steam64id> [@discord_user] <display name>
+    The @discord_user mention is optional — omit it to track a Steam-only player
+    with no rank role assignment. Use !linkdiscord later to add it."""
     if not STEAMID64_RE.fullmatch(steam_id):
         await ctx.send("❌ Invalid Steam64 ID (17 digits starting with 7656119...).")
         return
+    if not display_name:
+        await ctx.send("❌ Usage: `!addplayer <steam64id> [@discord_user] <display name>`")
+        return
     TRACKED_PLAYERS[steam_id] = display_name
-    ok = await asyncio.to_thread(db_add_player, steam_id, display_name)
+    if discord_user is not None:
+        PLAYER_DISCORD_IDS[steam_id] = discord_user.id
+    ok = await asyncio.to_thread(
+        db_add_player, steam_id, display_name,
+        discord_user.id if discord_user is not None else None
+    )
     if ok:
-        await ctx.send(f"✅ Now tracking **{display_name}** (`{steam_id}`).")
+        linked_note = f" (linked to {discord_user.mention})" if discord_user is not None else ""
+        await ctx.send(f"✅ Now tracking **{display_name}** (`{steam_id}`){linked_note}.")
     else:
         await ctx.send("⚠️ Saved in memory but Supabase write failed — check credentials.")
+
+@bot.command(name="linkdiscord")
+async def link_discord(ctx, steam_id: str, discord_user: discord.Member):
+    """!linkdiscord <steam64id> <@discord_user> — link a Discord account to an
+    already-tracked Steam ID, without removing/re-adding the player."""
+    if steam_id not in TRACKED_PLAYERS:
+        await ctx.send("That Steam ID isn't being tracked. Use `!addplayer` first.")
+        return
+    PLAYER_DISCORD_IDS[steam_id] = discord_user.id
+    ok = await asyncio.to_thread(db_link_discord, steam_id, discord_user.id)
+    if ok:
+        await ctx.send(f"🔗 Linked **{TRACKED_PLAYERS[steam_id]}** (`{steam_id}`) to {discord_user.mention}.")
+    else:
+        await ctx.send("⚠️ Linked in memory but Supabase write failed — check credentials.")
+    # Immediately assign a rank role so the person doesn't have to wait for a match.
+    profile = await asyncio.to_thread(fetch_profile, steam_id)
+    new_rating  = (profile or {}).get("ranks", {}).get("premier", 0)
+    new_bracket = get_rank_bracket(new_rating)
+    PLAYER_RANK_BRACKET[steam_id] = new_bracket
+    await asyncio.to_thread(db_update_rank_bracket, steam_id, new_bracket)
+    if ctx.guild:
+        await update_rank_role(ctx.guild, steam_id, new_bracket)
 
 @bot.command(name="removeplayer")
 async def remove_player(ctx, steam_id: str):
@@ -1306,11 +1443,50 @@ async def remove_player(ctx, steam_id: str):
         await ctx.send("That Steam ID isn't being tracked.")
         return
     name = TRACKED_PLAYERS.pop(steam_id)
+    discord_id = PLAYER_DISCORD_IDS.pop(steam_id, None)
+    PLAYER_RANK_BRACKET.pop(steam_id, None)
     ok = await asyncio.to_thread(db_remove_player, steam_id)
+
+    # Strip whatever rank role they were holding, since they're no longer tracked.
+    if discord_id and ctx.guild:
+        member = ctx.guild.get_member(discord_id)
+        if member:
+            try:
+                for role in list(member.roles):
+                    if role.name in RANK_ROLE_NAMES:
+                        await member.remove_roles(role)
+            except discord.Forbidden:
+                pass
+            except Exception as e:
+                print(f"[remove_player] role cleanup for {steam_id}: {e}")
+
     if ok:
         await ctx.send(f"🗑️ Removed **{name}** from tracking.")
     else:
         await ctx.send(f"Removed **{name}** from memory but Supabase delete failed.")
+
+@bot.command(name="syncranks")
+async def sync_ranks(ctx):
+    """!syncranks — re-fetch every linked player's current rank and re-assign their
+    Discord role, regardless of whether it changed. Useful for testing and for
+    retroactively fixing roles after first enabling this feature."""
+    if not LEETIFY_API_KEY:
+        await ctx.send("⚠️ `LEETIFY_API_KEY` is not set.")
+        return
+    if not PLAYER_DISCORD_IDS:
+        await ctx.send("No linked Discord accounts yet. Use `!addplayer` with a mention or `!linkdiscord`.")
+        return
+    async with ctx.typing():
+        updated = 0
+        for steam_id in list(PLAYER_DISCORD_IDS.keys()):
+            profile = await asyncio.to_thread(fetch_profile, steam_id)
+            new_rating  = (profile or {}).get("ranks", {}).get("premier", 0)
+            new_bracket = get_rank_bracket(new_rating)
+            PLAYER_RANK_BRACKET[steam_id] = new_bracket
+            await asyncio.to_thread(db_update_rank_bracket, steam_id, new_bracket)
+            await update_rank_role(ctx.guild, steam_id, new_bracket)
+            updated += 1
+    await ctx.send(f"✅ Synced rank roles for {updated} linked player(s).")
 
 @bot.command(name="players")
 async def list_players(ctx):
@@ -1318,7 +1494,13 @@ async def list_players(ctx):
     if not TRACKED_PLAYERS:
         await ctx.send("No players tracked yet. Use `!addplayer <steam64id> <name>`.")
         return
-    lines = [f"• **{name}** — `{sid}`" for sid, name in TRACKED_PLAYERS.items()]
+    lines = []
+    for sid, name in TRACKED_PLAYERS.items():
+        discord_id = PLAYER_DISCORD_IDS.get(sid)
+        link_note = f" — <@{discord_id}>" if discord_id else ""
+        bracket = PLAYER_RANK_BRACKET.get(sid)
+        bracket_note = f" `[{bracket}]`" if bracket else ""
+        lines.append(f"• **{name}** — `{sid}`{link_note}{bracket_note}")
     await ctx.send("**Tracked players:**\n" + "\n".join(lines))
 
 @bot.command(name="lastmatch")
@@ -1498,10 +1680,11 @@ async def force_weekly_recap(ctx, weeks_ago: int = 0):
 
 @bot.event
 async def on_ready():
-    global TRACKED_PLAYERS
+    global TRACKED_PLAYERS, PLAYER_DISCORD_IDS, PLAYER_RANK_BRACKET
     print(f"✅ Logged in as {bot.user}")
-    TRACKED_PLAYERS = await asyncio.to_thread(db_load_tracked)
-    print(f"📋 Loaded {len(TRACKED_PLAYERS)} tracked player(s) from Supabase.")
+    TRACKED_PLAYERS, PLAYER_DISCORD_IDS, PLAYER_RANK_BRACKET = await asyncio.to_thread(db_load_tracked)
+    print(f"📋 Loaded {len(TRACKED_PLAYERS)} tracked player(s) from Supabase "
+          f"({len(PLAYER_DISCORD_IDS)} linked to Discord).")
 
     # Catch up on any matches (including Faceit games) that happened while the
     # bot was offline, before starting the regular periodic checker.
@@ -1512,6 +1695,28 @@ async def on_ready():
                 print(f"[catch_up_missed_matches] Posted {posted} missed match(es) in {guild.name}.")
         except Exception as e:
             print(f"[catch_up_missed_matches] {guild.name}: {e}")
+
+    # Re-sync rank roles on every restart so a fresh deploy doesn't leave anyone
+    # without a role until their next game. Only touches linked players whose
+    # stored bracket doesn't match a role they currently hold.
+    for guild in bot.guilds:
+        for steam_id, discord_id in PLAYER_DISCORD_IDS.items():
+            try:
+                member = guild.get_member(discord_id)
+                if not member:
+                    continue
+                bracket = PLAYER_RANK_BRACKET.get(steam_id)
+                if not bracket:
+                    profile = await asyncio.to_thread(fetch_profile, steam_id)
+                    new_rating = (profile or {}).get("ranks", {}).get("premier", 0)
+                    bracket = get_rank_bracket(new_rating)
+                    PLAYER_RANK_BRACKET[steam_id] = bracket
+                    await asyncio.to_thread(db_update_rank_bracket, steam_id, bracket)
+                current_role_names = {r.name for r in member.roles}
+                if bracket not in current_role_names:
+                    await update_rank_role(guild, steam_id, bracket)
+            except Exception as e:
+                print(f"[on_ready rank sync] {steam_id}: {e}")
 
     check_leetify_stats.start()
     reset_poll_at_3am.start()
