@@ -1050,11 +1050,17 @@ def parse_match_embed(embed: discord.Embed) -> dict | None:
                 except (ValueError, IndexError):
                     continue
 
+        # Wingman is CS2's 2v2 mode (max 4 players total on the scoreboard, first
+        # to 9 rounds instead of 13). Its K/D/ADR/rating numbers aren't comparable
+        # to 5v5 games, so we flag it here and skip it in the weekly recap below.
+        is_wingman = len(players) > 0 and len(players) <= 4
+
         return {
-            "map":     map_name,
-            "score_ct": s_ct,
-            "score_t":  s_t,
-            "players":  players,
+            "map":        map_name,
+            "score_ct":   s_ct,
+            "score_t":    s_t,
+            "players":    players,
+            "is_wingman": is_wingman,
         }
     except Exception as e:
         print(f"[parse_match_embed] {e}")
@@ -1137,7 +1143,7 @@ async def build_weekly_recap(channel: discord.TextChannel, weeks_ago: int = 0) -
             continue
         for embed in message.embeds:
             parsed = parse_match_embed(embed)
-            if parsed:
+            if parsed and not parsed.get("is_wingman"):
                 matches.append(parsed)
 
     if not matches:
