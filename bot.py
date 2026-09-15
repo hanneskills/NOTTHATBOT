@@ -1076,12 +1076,16 @@ async def sync_rank_roles(guild: discord.Guild):
 async def run_automatic_catchup(guild: discord.Guild):
     """
     Full automatic catch-up flow for a guild: posts any matches missing from
-    #leetify (no week restriction — this is meant to cover for actual bot
-    downtime), then re-syncs rank roles. Used on startup and by the nightly
-    midnight catch-up task.
+    #leetify that finished this week, then re-syncs rank roles. Used on startup
+    and by the nightly midnight catch-up task.
+
+    Restricted to this week for the same reason as !catchup: a newly-tracked
+    player's whole match history is visible via the API, and without this
+    filter a restart (which happens on every redeploy) would flood #leetify
+    with backlog matches going back months.
     """
     try:
-        posted = await catch_up_missed_matches(guild)
+        posted = await catch_up_missed_matches(guild, since=catchup_week_start())
         if posted:
             print(f"[catch_up_missed_matches] Posted {posted} missed match(es) in {guild.name}.")
     except Exception as e:
