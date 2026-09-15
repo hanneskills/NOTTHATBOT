@@ -388,6 +388,16 @@ async def reset_poll_at_3am():
         reset_poll_state(keep_players=False)
         print("[Poll] Nightly reset at 03:00 UTC.")
 
+# --- Same automatic catch-up + rank sync that runs on restart, but every
+# --- midnight UTC too, so long uptimes without a restart don't drift. ---
+@tasks.loop(minutes=1)
+async def midnight_catchup_task():
+    now = datetime.now(timezone.utc)
+    if now.hour == 0 and now.minute == 0:
+        for guild in bot.guilds:
+            await run_automatic_catchup(guild)
+        print("[catch_up_missed_matches] Midnight catch-up run complete.")
+
 # =================================================================
 # 6. VOICE ROLE
 # =================================================================
@@ -922,7 +932,28 @@ async def check_leetify_stats():
 
 MAX_CATCHUP_MATCHES_PER_PLAYER = 15
 
-async def catch_up_missed_matches(guild: discord.Guild, max_per_player: int = MAX_CATCHUP_MATCHES_PER_PLAYER) -> int:
+def _parse_match_timestamp(ts: str):
+    """Parses a Leetify match timestamp (e.g. '2024-01-15T10:30:00Z') into an
+    aware UTC datetime. Returns None if it can't be parsed."""
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+def catchup_week_start() -> datetime:
+    """Start of the current (in-progress) week — most recent Monday 00:00 UTC.
+    Used to limit !catchup to this week's matches only."""
+    now = datetime.now(timezone.utc)
+    days_since_monday = now.weekday()  # Monday=0, Sunday=6
+    return (now - timedelta(days=days_since_monday)).replace(hour=0, minute=0, second=0, microsecond=0)
+
+async def catch_up_missed_matches(
+    guild: discord.Guild,
+    max_per_player: int = MAX_CATCHUP_MATCHES_PER_PLAYER,
+    since=None,
+) -> int:
     """
     Scans each tracked player's recent Leetify matches (this includes Faceit games,
     since Leetify syncs those in automatically) and posts any that are missing from
@@ -935,7 +966,12 @@ async def catch_up_missed_matches(guild: discord.Guild, max_per_player: int = MA
 
     Also rebaselines last_seen_matches to each player's current latest match, so the
     periodic check_leetify_stats loop doesn't try to re-announce something we just
-    caught up on.
+    caught up on. This rebaseline always uses each player's true latest match,
+    regardless of `since`.
+
+    `since`: if provided (an aware UTC datetime), only matches finishing at or after
+    this time are considered for posting — used by !catchup to only fetch matches
+    from the current week, leaving older missing matches alone.
 
     Returns the number of matches posted.
     """
@@ -960,7 +996,12 @@ async def catch_up_missed_matches(guild: discord.Guild, max_per_player: int = MA
             mid = m.get("id")
             if not mid:
                 continue
-            candidates[mid] = m.get("finished_at") or m.get("game_finished_at") or ""
+            ts = m.get("finished_at") or m.get("game_finished_at") or ""
+            if since is not None:
+                match_dt = _parse_match_timestamp(ts)
+                if match_dt is None or match_dt < since:
+                    continue
+            candidates[mid] = ts
 
     if not candidates:
         return 0
@@ -987,6 +1028,54 @@ async def catch_up_missed_matches(guild: discord.Guild, max_per_player: int = MA
             last_seen_matches[steam_id] = mid
 
     return posted
+
+
+async def sync_rank_roles(guild: discord.Guild):
+    """
+    Re-syncs each Discord-linked tracked player's rank-bracket role to match
+    their current Leetify rating. Only touches players whose stored bracket
+    doesn't match a role they currently hold (or who don't have a stored
+    bracket yet, in which case it's fetched fresh).
+
+    Run on bot startup, by the nightly midnight catch-up, and whenever
+    !catchup is run.
+    """
+    for steam_id, discord_id in list(PLAYER_DISCORD_IDS.items()):
+        try:
+            member = guild.get_member(discord_id)
+            if not member:
+                continue
+            bracket = PLAYER_RANK_BRACKET.get(steam_id)
+            if not bracket:
+                profile = await asyncio.to_thread(fetch_profile, steam_id)
+                new_rating = (profile or {}).get("ranks", {}).get("premier", 0)
+                bracket = get_rank_bracket(new_rating)
+                PLAYER_RANK_BRACKET[steam_id] = bracket
+                await asyncio.to_thread(db_update_rank_bracket, steam_id, bracket)
+            current_role_names = {r.name for r in member.roles}
+            if bracket not in current_role_names:
+                await update_rank_role(guild, steam_id, bracket)
+        except Exception as e:
+            print(f"[sync_rank_roles] {steam_id}: {e}")
+
+
+async def run_automatic_catchup(guild: discord.Guild):
+    """
+    Full automatic catch-up flow for a guild: posts any matches missing from
+    #leetify (no week restriction — this is meant to cover for actual bot
+    downtime), then re-syncs rank roles. Used on startup and by the nightly
+    midnight catch-up task.
+    """
+    try:
+        posted = await catch_up_missed_matches(guild)
+        if posted:
+            print(f"[catch_up_missed_matches] Posted {posted} missed match(es) in {guild.name}.")
+    except Exception as e:
+        print(f"[catch_up_missed_matches] {guild.name}: {e}")
+    try:
+        await sync_rank_roles(guild)
+    except Exception as e:
+        print(f"[sync_rank_roles] {guild.name}: {e}")
 
 
 # =================================================================
@@ -1617,9 +1706,10 @@ async def stats_command(ctx, steam_id: str):
 
 @bot.command(name="catchup")
 async def catchup_command(ctx):
-    """!catchup — check every tracked player's recent matches (including Faceit games
-    synced through Leetify) and post any that are missing from #leetify, e.g. games
-    that happened while the bot was down."""
+    """!catchup — check every tracked player's matches from this week (including
+    Faceit games synced through Leetify) and post any that are missing from
+    #leetify, e.g. games that happened while the bot was down. Matches from
+    previous weeks are left alone. Also re-syncs everyone's rank roles."""
     if not LEETIFY_API_KEY:
         await ctx.send("⚠️ `LEETIFY_API_KEY` is not set.")
         return
@@ -1631,11 +1721,12 @@ async def catchup_command(ctx):
         await ctx.send("❌ No `#leetify` channel found in this server.")
         return
     async with ctx.typing():
-        posted = await catch_up_missed_matches(ctx.guild)
+        posted = await catch_up_missed_matches(ctx.guild, since=catchup_week_start())
+        await sync_rank_roles(ctx.guild)
     if posted:
-        await ctx.send(f"✅ Caught up — posted {posted} missing match{'es' if posted != 1 else ''} in {leetify_channel.mention}.")
+        await ctx.send(f"✅ Caught up — posted {posted} missing match{'es' if posted != 1 else ''} from this week in {leetify_channel.mention}.")
     else:
-        await ctx.send("👍 Nothing missing — all recent matches are already posted.")
+        await ctx.send("👍 Nothing missing — all of this week's matches are already posted.")
 
 @bot.command(name="weeklyrecap")
 async def force_weekly_recap(ctx, weeks_ago: int = 0):
@@ -1693,40 +1784,15 @@ async def on_ready():
           f"({len(PLAYER_DISCORD_IDS)} linked to Discord).")
 
     # Catch up on any matches (including Faceit games) that happened while the
-    # bot was offline, before starting the regular periodic checker.
+    # bot was offline, and re-sync rank roles, before starting the regular
+    # periodic checker. (Same flow the nightly midnight_catchup_task runs.)
     for guild in bot.guilds:
-        try:
-            posted = await catch_up_missed_matches(guild)
-            if posted:
-                print(f"[catch_up_missed_matches] Posted {posted} missed match(es) in {guild.name}.")
-        except Exception as e:
-            print(f"[catch_up_missed_matches] {guild.name}: {e}")
-
-    # Re-sync rank roles on every restart so a fresh deploy doesn't leave anyone
-    # without a role until their next game. Only touches linked players whose
-    # stored bracket doesn't match a role they currently hold.
-    for guild in bot.guilds:
-        for steam_id, discord_id in PLAYER_DISCORD_IDS.items():
-            try:
-                member = guild.get_member(discord_id)
-                if not member:
-                    continue
-                bracket = PLAYER_RANK_BRACKET.get(steam_id)
-                if not bracket:
-                    profile = await asyncio.to_thread(fetch_profile, steam_id)
-                    new_rating = (profile or {}).get("ranks", {}).get("premier", 0)
-                    bracket = get_rank_bracket(new_rating)
-                    PLAYER_RANK_BRACKET[steam_id] = bracket
-                    await asyncio.to_thread(db_update_rank_bracket, steam_id, bracket)
-                current_role_names = {r.name for r in member.roles}
-                if bracket not in current_role_names:
-                    await update_rank_role(guild, steam_id, bracket)
-            except Exception as e:
-                print(f"[on_ready rank sync] {steam_id}: {e}")
+        await run_automatic_catchup(guild)
 
     check_leetify_stats.start()
     reset_poll_at_3am.start()
     weekly_recap_task.start()
+    midnight_catchup_task.start()
 
 # =================================================================
 # 12. RUN
