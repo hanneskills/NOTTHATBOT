@@ -969,9 +969,12 @@ async def catch_up_missed_matches(
     caught up on. This rebaseline always uses each player's true latest match,
     regardless of `since`.
 
-    `since`: if provided (an aware UTC datetime), only matches finishing at or after
-    this time are considered for posting — used by !catchup to only fetch matches
-    from the current week, leaving older missing matches alone.
+    `since`: if provided (an aware UTC datetime), only matches whose full match
+    record finished at or after this time are posted — used by !catchup to only
+    fetch matches from the current week, leaving older missing matches alone.
+    Checked against the full match data (fetch_full_match), not the summary
+    list, since the summary list's date can be unreliable for newly-added
+    players (see comment below).
 
     Returns the number of matches posted.
     """
@@ -996,12 +999,14 @@ async def catch_up_missed_matches(
             mid = m.get("id")
             if not mid:
                 continue
-            ts = m.get("finished_at") or m.get("game_finished_at") or ""
-            if since is not None:
-                match_dt = _parse_match_timestamp(ts)
-                if match_dt is None or match_dt < since:
-                    continue
-            candidates[mid] = ts
+            # NOTE: we deliberately do NOT date-filter using this summary row's
+            # finished_at/game_finished_at here. For newly-added players whose
+            # whole history gets bulk-imported at once, this field can reflect
+            # when Leetify synced the match rather than when it was actually
+            # played, which would let stale matches slip through a "this week"
+            # filter. The real date filtering (when `since` is given) happens
+            # below against the full match data instead, right before posting.
+            candidates[mid] = m.get("finished_at") or m.get("game_finished_at") or ""
 
     if not candidates:
         return 0
@@ -1014,6 +1019,15 @@ async def catch_up_missed_matches(
             match_data = await asyncio.to_thread(fetch_full_match, mid)
             if not match_data:
                 continue
+            if since is not None:
+                # Authoritative check against the full match record — the same
+                # finished_at field the embed itself displays — instead of the
+                # summary list's (unreliable) date.
+                match_ts = match_data.get("finished_at") or match_data.get("game_finished_at") or ""
+                match_dt = _parse_match_timestamp(match_ts)
+                if match_dt is None or match_dt < since:
+                    print(f"[catch_up_missed_matches] Skipping {mid} — dated {match_ts or 'unknown'}, before this week ({since}).")
+                    continue
             embed = build_match_embed(match_data)
             if not embed:
                 continue
