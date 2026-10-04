@@ -523,7 +523,10 @@ def fetch_profile_matches(steam_id: str) -> list | None:
             params={"steam64_id": steam_id},
             timeout=10
         )
-        return res.json() if res.status_code == 200 else None
+        if res.status_code != 200:
+            return None
+        # Rush matches are ignored everywhere in the bot.
+        return [m for m in res.json() if not is_rush_match(m)]
     except Exception as e:
         print(f"[fetch_profile_matches] {e}")
         return None
@@ -569,7 +572,7 @@ def build_profile_embeds(data: dict, steam_id: str, profile_matches: list | None
     rating       = data.get("rating", {})
     stats        = data.get("stats", {})
     ranks        = data.get("ranks", {})
-    recent       = data.get("recent_matches", [])
+    recent       = [m for m in data.get("recent_matches", []) if not is_rush_match(m)]
 
     aim_rtg      = rating.get("aim", 0)
     util_rtg     = rating.get("utility", 0)
@@ -750,11 +753,26 @@ def fetch_full_match(match_id: str) -> dict | None:
         return None
 
 
+def is_rush_match(match: dict | None) -> bool:
+    """True if this Leetify match record is from CS2's Rush game mode.
+    Rush matches show up with data_source "manual_rush" and map_name "rush_001"
+    (works for both the v3 profile-match summaries and the v2 full match record).
+    We never post or track these."""
+    if not match:
+        return False
+    source = str(match.get("data_source") or "").lower()
+    map_name = str(match.get("map_name") or "").lower()
+    return "rush" in source or map_name.startswith("rush")
+
+
 def build_match_embed(match_data: dict) -> discord.Embed | None:
     """
     Scoreboard-style embed with monospace table.
     NAME             K   D   ADR  HS%  RTG
     """
+    if is_rush_match(match_data):
+        print(f"[build_match_embed] Skipping Rush match {match_data.get('id')}.")
+        return None
     try:
         map_name  = match_data.get("map_name", "Unknown").replace("de_", "").title()
         match_id  = match_data.get("id", "")
@@ -889,7 +907,7 @@ async def check_leetify_stats():
             if res.status_code != 200:
                 continue
 
-            matches = res.json()
+            matches = [m for m in res.json() if not is_rush_match(m)]
             if not matches:
                 continue
 
@@ -997,7 +1015,7 @@ async def catch_up_missed_matches(
         latest_per_player[steam_id] = matches[0].get("id")
         for m in matches[:max_per_player]:
             mid = m.get("id")
-            if not mid:
+            if not mid or is_rush_match(m):
                 continue
             # NOTE: we deliberately do NOT date-filter using this summary row's
             # finished_at/game_finished_at here. For newly-added players whose
@@ -1162,7 +1180,11 @@ def parse_match_embed(embed: discord.Embed) -> dict | None:
         # to 5v5 games, so we flag it here and skip it in the weekly recap below.
         is_wingman = len(players) > 0 and len(players) <= 4
 
+        # Rush (3v3 mode) recaps posted before we started filtering them out.
+        is_rush = map_name.lower().startswith("rush")
+
         return {
+            "is_rush":    is_rush,
             "map":        map_name,
             "score_ct":   s_ct,
             "score_t":    s_t,
@@ -1250,7 +1272,7 @@ async def build_weekly_recap(channel: discord.TextChannel, weeks_ago: int = 0) -
             continue
         for embed in message.embeds:
             parsed = parse_match_embed(embed)
-            if parsed and not parsed.get("is_wingman"):
+            if parsed and not parsed.get("is_wingman") and not parsed.get("is_rush"):
                 matches.append(parsed)
 
     if not matches:
@@ -1629,7 +1651,7 @@ async def last_match(ctx, steam_id: str):
     if res.status_code != 200:
         await ctx.send(f"❌ Leetify returned `{res.status_code}`.")
         return
-    matches = res.json()
+    matches = [m for m in res.json() if not is_rush_match(m)]
     if not matches:
         await ctx.send("No matches found.")
         return
@@ -1637,6 +1659,9 @@ async def last_match(ctx, steam_id: str):
     match_data = await asyncio.to_thread(fetch_full_match, match_id)
     if not match_data:
         await ctx.send("Could not fetch full match data.")
+        return
+    if is_rush_match(match_data):
+        await ctx.send("⚠️ That's a Rush match — Rush games are ignored.")
         return
     embed = build_match_embed(match_data)
     if embed:
@@ -1666,6 +1691,9 @@ async def get_match(ctx, match_id: str):
         if not match_data:
             await ctx.send(f"❌ Could not fetch match `{match_id}`. Double check the match ID.")
             return
+        if is_rush_match(match_data):
+            await ctx.send("⚠️ That's a Rush match — Rush games are ignored.")
+            return
         embed = build_match_embed(match_data)
         if not embed:
             await ctx.send("❌ Could not parse match data.")
@@ -1692,6 +1720,9 @@ async def test_get_match(ctx, match_id: str):
         match_data = await asyncio.to_thread(fetch_full_match, match_id)
         if not match_data:
             await ctx.send(f"❌ Could not fetch match `{match_id}`. Double check the match ID.")
+            return
+        if is_rush_match(match_data):
+            await ctx.send("⚠️ That's a Rush match — Rush games are ignored.")
             return
         embed = build_match_embed(match_data)
         if not embed:
