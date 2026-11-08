@@ -63,11 +63,11 @@ def get_supabase_headers():
     }
 
 def db_load_tracked():
-    """Returns (tracked_players, player_discord_ids, player_rank_bracket) — three dicts
-    keyed by steam_id, loaded in one round trip."""
+    """Returns (tracked_players, player_discord_ids, player_rank_bracket, player_balance)
+    — four dicts keyed by steam_id, loaded in one round trip."""
     try:
         res = requests.get(
-            f"{SUPABASE_URL}/rest/v1/tracked_players?select=steam_id,display_name,discord_user_id,rank_bracket",
+            f"{SUPABASE_URL}/rest/v1/tracked_players?select=steam_id,display_name,discord_user_id,rank_bracket,balance",
             headers=get_supabase_headers(), timeout=10
         )
         if res.status_code == 200:
@@ -81,12 +81,16 @@ def db_load_tracked():
                 row["steam_id"]: row["rank_bracket"]
                 for row in rows if row.get("rank_bracket")
             }
-            return tracked, discord_ids, rank_brackets
+            balances = {
+                row["steam_id"]: int(row.get("balance") or 0)
+                for row in rows
+            }
+            return tracked, discord_ids, rank_brackets, balances
         print(f"[Supabase] Failed to load: {res.status_code} {res.text}")
-        return {}, {}, {}
+        return {}, {}, {}, {}
     except Exception as e:
         print(f"[Supabase] db_load_tracked error: {e}")
-        return {}, {}, {}
+        return {}, {}, {}, {}
 
 def db_add_player(steam_id, display_name, discord_user_id=None):
     try:
@@ -136,6 +140,19 @@ def db_update_rank_bracket(steam_id, bracket):
         return res.status_code in (200, 204)
     except Exception as e:
         print(f"[Supabase] db_update_rank_bracket error: {e}")
+        return False
+
+def db_update_balance(steam_id, balance):
+    """Writes the absolute balance for one player."""
+    try:
+        res = requests.patch(
+            f"{SUPABASE_URL}/rest/v1/tracked_players?steam_id=eq.{steam_id}",
+            headers=get_supabase_headers(),
+            json={"balance": int(balance)}, timeout=10
+        )
+        return res.status_code in (200, 204)
+    except Exception as e:
+        print(f"[Supabase] db_update_balance error: {e}")
         return False
 
 # =================================================================
@@ -437,6 +454,78 @@ TRACKED_PLAYERS   = {}
 # Discord role-per-rank-bracket state
 PLAYER_DISCORD_IDS  = {}   # steam_id -> discord_user_id
 PLAYER_RANK_BRACKET = {}   # steam_id -> last-assigned bracket string
+
+# ── Economy ─────────────────────────────────────────────────────────
+# Balances live in the `balance` column of tracked_players (bigint, default 0).
+# Weekly payouts (paid by the automatic Sunday recap only):
+#   +1 point per kill, +5 per top frag, +50 for the best kills/game.
+PLAYER_BALANCE = {}        # steam_id -> int balance
+BALANCE_LOCK   = asyncio.Lock()
+POINTS_PER_KILL     = 1
+POINTS_PER_TOPFRAG  = 5
+POINTS_BEST_KPG     = 50
+# Minimum games in the week to be eligible for the best-K/G bonus, so a
+# single lucky game can't win it. Set to 1 to disable this restriction.
+MIN_GAMES_FOR_BEST_KPG = 3
+
+def steam_id_for_discord(discord_id: int) -> str | None:
+    for sid, did in PLAYER_DISCORD_IDS.items():
+        if did == discord_id:
+            return sid
+    return None
+
+async def adjust_balance(steam_id: str, delta: int) -> int | None:
+    """Adds `delta` (may be negative) to a player's balance and persists it.
+    Returns the new balance, or None if it would go below zero."""
+    async with BALANCE_LOCK:
+        new = PLAYER_BALANCE.get(steam_id, 0) + delta
+        if new < 0:
+            return None
+        PLAYER_BALANCE[steam_id] = new
+        if not await asyncio.to_thread(db_update_balance, steam_id, new):
+            print(f"[economy] Supabase write failed for {steam_id} (balance {new}).")
+        return new
+
+async def transfer_balance(from_sid: str, to_sid: str, amount: int) -> bool:
+    """Moves `amount` between two players atomically (under the lock).
+    Returns False if the sender can't afford it."""
+    async with BALANCE_LOCK:
+        if PLAYER_BALANCE.get(from_sid, 0) < amount:
+            return False
+        PLAYER_BALANCE[from_sid] = PLAYER_BALANCE.get(from_sid, 0) - amount
+        PLAYER_BALANCE[to_sid]   = PLAYER_BALANCE.get(to_sid, 0) + amount
+        for sid in (from_sid, to_sid):
+            if not await asyncio.to_thread(db_update_balance, sid, PLAYER_BALANCE[sid]):
+                print(f"[economy] Supabase write failed for {sid}.")
+        return True
+
+def compute_weekly_payouts(player_stats: dict) -> dict:
+    """player_stats: {display_name: {kills, games, topfrags, adr_sum, ...}}
+    Returns {steam_id: {"name", "kills", "topfrags", "best_kpg", "total"}} for
+    tracked players only. Ties for best K/G all receive the bonus."""
+    name_to_sid = {name: sid for sid, name in TRACKED_PLAYERS.items()}
+
+    eligible = {
+        n: s["kills"] / s["games"]
+        for n, s in player_stats.items()
+        if s["games"] >= MIN_GAMES_FOR_BEST_KPG
+    }
+    best = max(eligible.values()) if eligible else None
+
+    payouts = {}
+    for name, s in player_stats.items():
+        sid = name_to_sid.get(name)
+        if not sid:
+            continue
+        kill_pts = s["kills"] * POINTS_PER_KILL
+        top_pts  = s["topfrags"] * POINTS_PER_TOPFRAG
+        kpg_pts  = POINTS_BEST_KPG if (best is not None and name in eligible
+                                       and abs(eligible[name] - best) < 1e-9) else 0
+        total = kill_pts + top_pts + kpg_pts
+        if total > 0:
+            payouts[sid] = {"name": name, "kills": kill_pts, "topfrags": top_pts,
+                            "best_kpg": kpg_pts, "total": total}
+    return payouts
 
 # Bracket thresholds used for the auto-assigned Discord rank roles. These are
 # intentionally coarser than PREMIER_RANKS (which drives the !stats label) —
@@ -1233,7 +1322,8 @@ def _join_capped(lines: list[str], limit: int = 1024) -> str:
     return "\n".join(kept)
 
 
-async def build_weekly_recap(channel: discord.TextChannel, weeks_ago: int = 0) -> list[discord.Embed] | None:
+async def build_weekly_recap(channel: discord.TextChannel, weeks_ago: int = 0,
+                             stats_out: dict | None = None) -> list[discord.Embed] | None:
     """
     Scrapes messages in `channel` for one week's worth of bot match embeds, and
     returns a list of Weekly Recap embeds: [maps_embed, kills_embed, frags_embed].
@@ -1370,6 +1460,10 @@ async def build_weekly_recap(channel: discord.TextChannel, weeks_ago: int = 0) -
                 if k is not None and k == fewest_kills:
                     player_stats[n]["bottomfrags"] += 1
 
+    # Hand the aggregated per-player stats back to the caller (used for payouts).
+    if stats_out is not None:
+        stats_out.update(player_stats)
+
     # ── Build embeds ────────────────────────────────────────────────
     # For a completed week, week_end is the *next* Monday 00:00 UTC — display
     # the Sunday date it actually ended on instead of that following Monday.
@@ -1504,8 +1598,24 @@ async def weekly_recap_task():
         try:
             # Matches are scraped from #leetify (where scoreboards get posted),
             # but the resulting recap embeds are posted to #weekly.
-            embeds = await build_weekly_recap(leetify_channel)
+            stats = {}
+            embeds = await build_weekly_recap(leetify_channel, stats_out=stats)
             if embeds:
+                # Pay out this week's points and add a payout embed to the recap.
+                payouts = compute_weekly_payouts(stats)
+                if payouts:
+                    for sid, p in payouts.items():
+                        await adjust_balance(sid, p["total"])
+                    pay_embed = discord.Embed(title="💰 Weekly Payouts", color=discord.Color.green())
+                    pay_lines = [f"`{_pad('PLAYER', 16)}{_rpad('KILLS', 6)}{_rpad('TOP', 5)}{_rpad('K/G', 5)}{_rpad('TOTAL', 7)}`"]
+                    for sid, p in sorted(payouts.items(), key=lambda x: x[1]["total"], reverse=True):
+                        pay_lines.append(
+                            f"`{_pad(p['name'], 16)}{_rpad(p['kills'], 6)}{_rpad(p['topfrags'], 5)}"
+                            f"{_rpad(p['best_kpg'], 5)}{_rpad(p['total'], 7)}`"
+                        )
+                    pay_embed.add_field(name="Points earned", value=_join_capped(pay_lines), inline=False)
+                    pay_embed.set_footer(text="1/kill · 5/top frag · 50 for best K/G")
+                    embeds.append(pay_embed)
                 for i, e in enumerate(embeds):
                     try:
                         await weekly_channel.send(embed=e)
@@ -1580,6 +1690,7 @@ async def remove_player(ctx, steam_id: str):
     name = TRACKED_PLAYERS.pop(steam_id)
     discord_id = PLAYER_DISCORD_IDS.pop(steam_id, None)
     PLAYER_RANK_BRACKET.pop(steam_id, None)
+    PLAYER_BALANCE.pop(steam_id, None)
     ok = await asyncio.to_thread(db_remove_player, steam_id)
 
     # Strip whatever rank role they were holding, since they're no longer tracked.
@@ -1599,6 +1710,60 @@ async def remove_player(ctx, steam_id: str):
         await ctx.send(f"🗑️ Removed **{name}** from tracking.")
     else:
         await ctx.send(f"Removed **{name}** from memory but Supabase delete failed.")
+
+@bot.command(name="balance", aliases=["bal"])
+async def balance_command(ctx, member: discord.Member = None):
+    """!balance [@user] — show your balance (or someone else's)."""
+    target = member or ctx.author
+    sid = steam_id_for_discord(target.id)
+    if not sid:
+        who = "You don't" if target == ctx.author else f"{target.display_name} doesn't"
+        await ctx.send(f"❌ {who} have a linked tracked player. Use `!linkdiscord` first.")
+        return
+    await ctx.send(f"💰 **{target.display_name}** has **{PLAYER_BALANCE.get(sid, 0):,}** points.")
+
+@bot.command(name="transfer")
+async def transfer_command(ctx, amount: int, recipient: discord.Member):
+    """!transfer <amount> @user — give some of your balance to someone else."""
+    if amount <= 0:
+        await ctx.send("❌ Amount must be a positive whole number.")
+        return
+    if recipient.id == ctx.author.id:
+        await ctx.send("❌ You can't transfer to yourself.")
+        return
+    if recipient.bot:
+        await ctx.send("❌ You can't transfer to a bot.")
+        return
+    from_sid = steam_id_for_discord(ctx.author.id)
+    to_sid   = steam_id_for_discord(recipient.id)
+    if not from_sid:
+        await ctx.send("❌ You don't have a linked tracked player, so you have no balance.")
+        return
+    if not to_sid:
+        await ctx.send(f"❌ {recipient.display_name} doesn't have a linked tracked player.")
+        return
+    if not await transfer_balance(from_sid, to_sid, amount):
+        await ctx.send(f"❌ Not enough balance — you have **{PLAYER_BALANCE.get(from_sid, 0):,}**.")
+        return
+    await ctx.send(
+        f"✅ Transferred **{amount:,}** to {recipient.mention}. "
+        f"Your balance: **{PLAYER_BALANCE[from_sid]:,}**."
+    )
+
+@bot.command(name="testgive")
+@commands.has_permissions(administrator=True)
+async def test_give(ctx, member: discord.Member, amount: int):
+    """!testgive @user <amount> — TEST ONLY (admins). Adds (or with a negative
+    number, removes) balance for a linked player."""
+    sid = steam_id_for_discord(member.id)
+    if not sid:
+        await ctx.send(f"❌ {member.display_name} doesn't have a linked tracked player.")
+        return
+    new = await adjust_balance(sid, amount)
+    if new is None:
+        await ctx.send("❌ That would take the balance below zero.")
+        return
+    await ctx.send(f"🧪 [TEST] {member.mention} now has **{new:,}** points ({amount:+,}).")
 
 @bot.command(name="syncranks")
 async def sync_ranks(ctx):
@@ -1826,9 +1991,9 @@ async def force_weekly_recap(ctx, weeks_ago: int = 0):
 
 @bot.event
 async def on_ready():
-    global TRACKED_PLAYERS, PLAYER_DISCORD_IDS, PLAYER_RANK_BRACKET
+    global TRACKED_PLAYERS, PLAYER_DISCORD_IDS, PLAYER_RANK_BRACKET, PLAYER_BALANCE
     print(f"✅ Logged in as {bot.user}")
-    TRACKED_PLAYERS, PLAYER_DISCORD_IDS, PLAYER_RANK_BRACKET = await asyncio.to_thread(db_load_tracked)
+    TRACKED_PLAYERS, PLAYER_DISCORD_IDS, PLAYER_RANK_BRACKET, PLAYER_BALANCE = await asyncio.to_thread(db_load_tracked)
     print(f"📋 Loaded {len(TRACKED_PLAYERS)} tracked player(s) from Supabase "
           f"({len(PLAYER_DISCORD_IDS)} linked to Discord).")
 
