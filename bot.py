@@ -466,7 +466,7 @@ POINTS_PER_TOPFRAG  = 5
 POINTS_BEST_KPG     = 50
 # Minimum games in the week to be eligible for the best-K/G bonus, so a
 # single lucky game can't win it. Set to 1 to disable this restriction.
-MIN_GAMES_FOR_BEST_KPG = 1
+MIN_GAMES_FOR_BEST_KPG = 3
 
 def steam_id_for_discord(discord_id: int) -> str | None:
     for sid, did in PLAYER_DISCORD_IDS.items():
@@ -1581,6 +1581,20 @@ async def build_weekly_recap(channel: discord.TextChannel, weeks_ago: int = 0,
     return embeds
 
 
+def build_payout_embed(payouts: dict) -> discord.Embed:
+    """The '💰 Weekly Payouts' embed shown after a weekly recap."""
+    pay_embed = discord.Embed(title="💰 Weekly Payouts", color=discord.Color.green())
+    pay_lines = [f"`{_pad('PLAYER', 16)}{_rpad('KILLS', 6)}{_rpad('TOP', 5)}{_rpad('K/G', 5)}{_rpad('TOTAL', 7)}`"]
+    for sid, p in sorted(payouts.items(), key=lambda x: x[1]["total"], reverse=True):
+        pay_lines.append(
+            f"`{_pad(p['name'], 16)}{_rpad(p['kills'], 6)}{_rpad(p['topfrags'], 5)}"
+            f"{_rpad(p['best_kpg'], 5)}{_rpad(p['total'], 7)}`"
+        )
+    pay_embed.add_field(name="Points earned", value=_join_capped(pay_lines), inline=False)
+    pay_embed.set_footer(text="1/kill · 5/top frag · 50 for best K/G")
+    return pay_embed
+
+
 @tasks.loop(minutes=1)
 async def weekly_recap_task():
     """Posts weekly recap every Sunday at 22:00 UTC (midnight Belgian time)."""
@@ -1606,16 +1620,7 @@ async def weekly_recap_task():
                 if payouts:
                     for sid, p in payouts.items():
                         await adjust_balance(sid, p["total"])
-                    pay_embed = discord.Embed(title="💰 Weekly Payouts", color=discord.Color.green())
-                    pay_lines = [f"`{_pad('PLAYER', 16)}{_rpad('KILLS', 6)}{_rpad('TOP', 5)}{_rpad('K/G', 5)}{_rpad('TOTAL', 7)}`"]
-                    for sid, p in sorted(payouts.items(), key=lambda x: x[1]["total"], reverse=True):
-                        pay_lines.append(
-                            f"`{_pad(p['name'], 16)}{_rpad(p['kills'], 6)}{_rpad(p['topfrags'], 5)}"
-                            f"{_rpad(p['best_kpg'], 5)}{_rpad(p['total'], 7)}`"
-                        )
-                    pay_embed.add_field(name="Points earned", value=_join_capped(pay_lines), inline=False)
-                    pay_embed.set_footer(text="1/kill · 5/top frag · 50 for best K/G")
-                    embeds.append(pay_embed)
+                    embeds.append(build_payout_embed(payouts))
                 for i, e in enumerate(embeds):
                     try:
                         await weekly_channel.send(embed=e)
@@ -1750,20 +1755,41 @@ async def transfer_command(ctx, amount: int, recipient: discord.Member):
         f"Your balance: **{PLAYER_BALANCE[from_sid]:,}**."
     )
 
-@bot.command(name="testgive")
+ONE_TIME_PAYOUT_USED = False
+
+@bot.command(name="payoutrecap")
 @commands.has_permissions(administrator=True)
-async def test_give(ctx, member: discord.Member, amount: int):
-    """!testgive @user <amount> — TEST ONLY (admins). Adds (or with a negative
-    number, removes) balance for a linked player."""
-    sid = steam_id_for_discord(member.id)
-    if not sid:
-        await ctx.send(f"❌ {member.display_name} doesn't have a linked tracked player.")
+async def payout_recap(ctx, weeks_ago: int = 0):
+    """!payoutrecap [weeks_ago] — ONE-TIME catch-up: pays out balance for an
+    already-posted weekly recap (default 0 = the current week, same week
+    !weeklyrecap shows; use 1 for last week, e.g. after Monday 00:00 UTC) and
+    posts the Weekly Payouts embed in #weekly. Can only be used once per bot run;
+    remove this command after using it."""
+    global ONE_TIME_PAYOUT_USED
+    if ONE_TIME_PAYOUT_USED:
+        await ctx.send("❌ This one-time payout was already used.")
         return
-    new = await adjust_balance(sid, amount)
-    if new is None:
-        await ctx.send("❌ That would take the balance below zero.")
+    if weeks_ago < 0:
+        await ctx.send("❌ Weeks back can't be negative.")
         return
-    await ctx.send(f"🧪 [TEST] {member.mention} now has **{new:,}** points ({amount:+,}).")
+    leetify_channel = discord.utils.get(ctx.guild.text_channels, name=LEETIFY_CHANNEL_NAME)
+    weekly_channel  = discord.utils.get(ctx.guild.text_channels, name=WEEKLY_CHANNEL_NAME)
+    if not leetify_channel or not weekly_channel:
+        await ctx.send("❌ Need both a `#leetify` and a `#weekly` channel.")
+        return
+    async with ctx.typing():
+        stats = {}
+        embeds = await build_weekly_recap(leetify_channel, weeks_ago=weeks_ago, stats_out=stats)
+        payouts = compute_weekly_payouts(stats) if embeds else {}
+        if not payouts:
+            await ctx.send("📅 No payable matches found for that week — nothing paid.")
+            return
+        ONE_TIME_PAYOUT_USED = True
+        for sid, p in payouts.items():
+            await adjust_balance(sid, p["total"])
+        await weekly_channel.send(embed=build_payout_embed(payouts))
+    if ctx.channel != weekly_channel:
+        await ctx.send(f"✅ Paid out {len(payouts)} player(s); payouts posted in {weekly_channel.mention}.")
 
 @bot.command(name="syncranks")
 async def sync_ranks(ctx):
