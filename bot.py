@@ -466,7 +466,7 @@ POINTS_PER_TOPFRAG  = 5
 POINTS_BEST_KPG     = 50
 # Minimum games in the week to be eligible for the best-K/G bonus, so a
 # single lucky game can't win it. Set to 1 to disable this restriction.
-MIN_GAMES_FOR_BEST_KPG = 3
+MIN_GAMES_FOR_BEST_KPG = 1
 
 def steam_id_for_discord(discord_id: int) -> str | None:
     for sid, did in PLAYER_DISCORD_IDS.items():
