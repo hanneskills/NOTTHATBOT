@@ -452,6 +452,37 @@ STEAMID64_RE     = re.compile(r'\b(7656119\d{10})\b')
 STEAM_PROFILE_RE = re.compile(r'steamcommunity\.com/profiles/(\d+)')
 STEAM_CUSTOM_RE  = re.compile(r'steamcommunity\.com/id/([^/\s?]+)')
 last_seen_matches = {}
+def db_load_house():
+    """Returns the all-time total paid out (int) from the `house` table (row id=1)."""
+    try:
+        res = requests.get(
+            f"{SUPABASE_URL}/rest/v1/house?id=eq.1&select=total_paid_out",
+            headers=get_supabase_headers(), timeout=10
+        )
+        if res.status_code == 200:
+            rows = res.json()
+            if rows:
+                return int(rows[0].get("total_paid_out") or 0)
+            return 0
+        print(f"[Supabase] Failed to load house: {res.status_code} {res.text}")
+    except Exception as e:
+        print(f"[Supabase] db_load_house error: {e}")
+    return 0
+
+def db_update_house(total_paid_out, house_balance):
+    """Upserts the single house row (id=1)."""
+    try:
+        res = requests.post(
+            f"{SUPABASE_URL}/rest/v1/house",
+            headers={**get_supabase_headers(), "Prefer": "resolution=merge-duplicates"},
+            json={"id": 1, "total_paid_out": int(total_paid_out),
+                  "house_balance": int(house_balance)}, timeout=10
+        )
+        return res.status_code in (200, 201, 204)
+    except Exception as e:
+        print(f"[Supabase] db_update_house error: {e}")
+        return False
+
 TRACKED_PLAYERS   = {}
 
 # Discord role-per-rank-bracket state
@@ -464,6 +495,16 @@ PLAYER_RANK_BRACKET = {}   # steam_id -> last-assigned bracket string
 #   +1 point per kill, +5 per top frag, +50 for the best kills/game.
 PLAYER_BALANCE = {}        # steam_id -> int balance
 BALANCE_LOCK   = asyncio.Lock()
+# House balance = (all-time weekly payouts) - (sum of all current player balances).
+# Stored in the `house` table (single row, id=1): total_paid_out, house_balance.
+HOUSE_TOTAL_PAID_OUT = 0
+
+async def sync_house_balance():
+    """Recomputes house_balance and writes it to Supabase. Call while holding
+    BALANCE_LOCK (or at startup) so the numbers are consistent."""
+    house_balance = HOUSE_TOTAL_PAID_OUT - sum(PLAYER_BALANCE.values())
+    if not await asyncio.to_thread(db_update_house, HOUSE_TOTAL_PAID_OUT, house_balance):
+        print(f"[economy] Supabase write failed for house balance ({house_balance}).")
 POINTS_PER_KILL     = 1
 POINTS_PER_TOPFRAG  = 5
 POINTS_BEST_KPG     = 50
@@ -477,16 +518,22 @@ def steam_id_for_discord(discord_id: int) -> str | None:
             return sid
     return None
 
-async def adjust_balance(steam_id: str, delta: int) -> int | None:
+async def adjust_balance(steam_id: str, delta: int, paid_out: bool = False) -> int | None:
     """Adds `delta` (may be negative) to a player's balance and persists it.
-    Returns the new balance, or None if it would go below zero."""
+    Pass paid_out=True for weekly payouts so they count toward the house's
+    all-time total paid out. Returns the new balance, or None if it would go
+    below zero."""
+    global HOUSE_TOTAL_PAID_OUT
     async with BALANCE_LOCK:
         new = PLAYER_BALANCE.get(steam_id, 0) + delta
         if new < 0:
             return None
         PLAYER_BALANCE[steam_id] = new
+        if paid_out:
+            HOUSE_TOTAL_PAID_OUT += delta
         if not await asyncio.to_thread(db_update_balance, steam_id, new):
             print(f"[economy] Supabase write failed for {steam_id} (balance {new}).")
+        await sync_house_balance()
         return new
 
 async def transfer_balance(from_sid: str, to_sid: str, amount: int) -> bool:
@@ -1622,7 +1669,7 @@ async def weekly_recap_task():
                 payouts = compute_weekly_payouts(stats)
                 if payouts:
                     for sid, p in payouts.items():
-                        await adjust_balance(sid, p["total"])
+                        await adjust_balance(sid, p["total"], paid_out=True)
                     embeds.append(build_payout_embed(payouts))
                 for i, e in enumerate(embeds):
                     try:
@@ -1698,7 +1745,9 @@ async def remove_player(ctx, steam_id: str):
     name = TRACKED_PLAYERS.pop(steam_id)
     discord_id = PLAYER_DISCORD_IDS.pop(steam_id, None)
     PLAYER_RANK_BRACKET.pop(steam_id, None)
-    PLAYER_BALANCE.pop(steam_id, None)
+    async with BALANCE_LOCK:
+        PLAYER_BALANCE.pop(steam_id, None)
+        await sync_house_balance()
     ok = await asyncio.to_thread(db_remove_player, steam_id)
 
     # Strip whatever rank role they were holding, since they're no longer tracked.
@@ -2217,7 +2266,8 @@ async def coinflip_reactions(payload):
 # =================================================================
 # !hilo <amount>: the bot draws from a single shuffled 52-card deck (no
 # repeats, aces high) and shows a card. The starter guesses ⬆️ higher or
-# ⬇️ lower for the next card, and may ✅ cash out between guesses.
+# ⬇️ lower for the next card. You MUST make at least one guess; only after
+# that may you ✅ cash out between guesses (no skipping a bad first card).
 #
 # Payouts are FAIR (no house edge): with H cards higher and L cards lower
 # left in the deck, a correct guess multiplies the pot by (H+L)/H (higher)
@@ -2230,7 +2280,9 @@ async def coinflip_reactions(payload):
 # per player at a time, only the starter can click, the pot is tracked as an
 # exact fraction and the payout is rounded DOWN to whole points at the end
 # (rounding up would let people farm free points with 1-point bets on
-# near-certain guesses). An idle run auto-cashes out after HL_IDLE_TIMEOUT.
+# near-certain guesses). Idle handling after HL_IDLE_TIMEOUT: if no guess has
+# been made yet, the bot auto-picks the safest option (most remaining cards;
+# random on an exact tie); otherwise the run auto-cashes out.
 
 HL_UP, HL_DOWN, HL_CASH = "⬆️", "⬇️", "✅"
 HL_IDLE_TIMEOUT = 120
@@ -2267,16 +2319,22 @@ def _hl_embed(game, final_status: str | None = None, color=None) -> discord.Embe
     else:
         higher, lower = _hl_counts(game)
         total = higher + lower
+        if game["guesses"] > 0:
+            cash_line = f"{HL_CASH} Cash out **{pot:,}**\n"
+            idle_note = "auto cash out"
+        else:
+            cash_line = "🔒 You must make at least one guess before you can cash out\n"
+            idle_note = "safest option auto-picked"
         embed.description = (
             f"<@{game['creator_id']}>\n"
             f"Current card: {_hl_label(game['current'])}\n"
             f"Pot: **{pot:,}**\n\n"
             f"{HL_UP} Higher {_hl_fmt_mult(_hl_mult(total, higher))}\n"
             f"{HL_DOWN} Lower {_hl_fmt_mult(_hl_mult(total, lower))}\n"
-            f"{HL_CASH} Cash out **{pot:,}**\n\n"
+            f"{cash_line}\n"
             f"**Steps so far:**\n{history}"
         )
-        embed.set_footer(text=f"Idle for {HL_IDLE_TIMEOUT // 60} min = auto cash out · {len(game['deck'])} cards left")
+        embed.set_footer(text=f"Idle for {HL_IDLE_TIMEOUT // 60} min = {idle_note} · {len(game['deck'])} cards left")
     return embed
 
 def _hl_reset_timer(message_id: int, game: dict):
@@ -2290,7 +2348,16 @@ async def _hl_idle(message_id: int):
     game = HILO.get(message_id)
     if game and game["state"] == "active" and not game["busy"]:
         game["busy"] = True
-        await _hl_finish(game, message_id, "idle")
+        if game["guesses"] == 0:
+            # Haven't gone yet: auto-pick the safest option (most cards left).
+            higher, lower = _hl_counts(game)
+            if higher != lower:
+                guess_up = higher > lower
+            else:
+                guess_up = random.choice((True, False))
+            await _hl_play(game, message_id, guess_up, auto=True)
+        else:
+            await _hl_finish(game, message_id, "idle")
 
 async def _hl_finish(game: dict, message_id: int, kind: str):
     """kind: 'cash' | 'idle' | 'exhausted' (all pay out the pot) or 'lost'."""
@@ -2349,12 +2416,14 @@ async def higherlower_command(ctx, amount: int):
         "pot": Fraction(amount), "deck": deck, "current": first,
         "history": [f"🃏 Start: {_hl_label(first)}"],
         "state": "active", "busy": False, "message": None, "task": None,
+        "guesses": 0,   # cash out is locked until this is >= 1
     }
     try:
         msg = await ctx.send(embed=_hl_embed(game))
         game["message"] = msg
         HILO[msg.id] = game
-        for e in (HL_UP, HL_DOWN, HL_CASH):
+        # The cash-out reaction is only added after the first guess.
+        for e in (HL_UP, HL_DOWN):
             await msg.add_reaction(e)
     except Exception as e:
         # Couldn't post the game — give the bet back.
@@ -2388,6 +2457,9 @@ async def hilo_reactions(payload):
     if emoji not in (HL_UP, HL_DOWN, HL_CASH):
         return
 
+    if emoji == HL_CASH and game["guesses"] == 0:
+        return   # locked: you have to make at least one guess first
+
     game["busy"] = True
     message_id = payload.message_id
 
@@ -2396,31 +2468,40 @@ async def hilo_reactions(payload):
         return
 
     higher, lower = _hl_counts(game)
-    total = higher + lower
     guess_up = (emoji == HL_UP)
     if (guess_up and higher == 0) or (not guess_up and lower == 0):
         game["busy"] = False
         await _cf_notice(game["message"].channel.id,
-                         f"❌ <@{game['creator_id']}> no card can be {'higher' if guess_up else 'lower'} — pick the other option or cash out.")
+                         f"❌ <@{game['creator_id']}> no card can be {'higher' if guess_up else 'lower'} — pick the other option.")
         return
 
+    await _hl_play(game, message_id, guess_up)
+
+async def _hl_play(game: dict, message_id: int, guess_up: bool, auto: bool = False):
+    """Resolves one guess. Caller must have set game["busy"] = True."""
+    msg = game["message"]
+    emoji = HL_UP if guess_up else HL_DOWN
+    tag = " 🤖 (auto-picked)" if auto else ""
     try:
+        higher, lower = _hl_counts(game)
+        total = higher + lower
         mult = _hl_mult(total, higher if guess_up else lower)
         prev_label = _hl_label(game["current"])
         prev_rank  = game["current"][0]
         nxt = game["deck"].pop()
         game["current"] = nxt
+        game["guesses"] += 1
         nxt_label = _hl_label(nxt)
 
         if nxt[0] == prev_rank:
-            game["history"].append(f"{emoji} {prev_label} → {nxt_label} ➖ push (pot unchanged)")
+            game["history"].append(f"{emoji} {prev_label} → {nxt_label} ➖ push (pot unchanged){tag}")
         elif (nxt[0] > prev_rank) == guess_up:
             game["pot"] = game["pot"] * mult
             game["history"].append(
-                f"{emoji} {prev_label} → {nxt_label} ✅ {_hl_fmt_mult(mult)} → pot {math.floor(game['pot']):,}"
+                f"{emoji} {prev_label} → {nxt_label} ✅ {_hl_fmt_mult(mult)} → pot {math.floor(game['pot']):,}{tag}"
             )
         else:
-            game["history"].append(f"{emoji} {prev_label} → {nxt_label} ❌ wrong")
+            game["history"].append(f"{emoji} {prev_label} → {nxt_label} ❌ wrong{tag}")
             await _hl_finish(game, message_id, "lost")
             return
 
@@ -2431,6 +2512,11 @@ async def hilo_reactions(payload):
             return
 
         await msg.edit(embed=_hl_embed(game))
+        if game["guesses"] == 1:
+            try:
+                await msg.add_reaction(HL_CASH)   # unlock cash out
+            except Exception as e:
+                print(f"[hilo] couldn't add cash-out reaction: {e}")
         _hl_reset_timer(message_id, game)
     finally:
         if game["state"] == "active":
@@ -3748,7 +3834,7 @@ Earn points every Sunday: +1 per kill, +5 per top frag, +50 for the best kills/g
 
 🎲 **Games**
 `!coinflip <amount>` (`!cf`) — pick heads or tails, then another player takes the other side or you flip vs the bot
-`!higherlower <amount>` (`!hilo`) — guess higher/lower on the next card; each correct guess raises the multiplier, ✅ cash out any time
+`!higherlower <amount>` (`!hilo`) — guess higher/lower on the next card; each correct guess raises the multiplier. You must guess at least once, then ✅ cash out any time (idle before your first guess = safest option is auto-picked)
 `!blackjack <amount>` (`!bj`) — 🃏 hit · ✋ stand · 💰 double down; blackjack pays 2:1
 `!roulette <amount> <red|black|green>` (`!rl`) — everyone in the channel bets on one shared wheel; red/black pay 1:1, green pays 14:1, and a 0 (green) beats red/black
 `!russianroulette <amount>` (`!rr`, `!russian`) — 🔫 duel another player to the death, or play vs the revolver with rising payouts
@@ -3798,9 +3884,12 @@ async def help_command(ctx):
 
 @bot.event
 async def on_ready():
-    global TRACKED_PLAYERS, PLAYER_DISCORD_IDS, PLAYER_RANK_BRACKET, PLAYER_BALANCE
+    global TRACKED_PLAYERS, PLAYER_DISCORD_IDS, PLAYER_RANK_BRACKET, PLAYER_BALANCE, HOUSE_TOTAL_PAID_OUT
     print(f"✅ Logged in as {bot.user}")
     TRACKED_PLAYERS, PLAYER_DISCORD_IDS, PLAYER_RANK_BRACKET, PLAYER_BALANCE = await asyncio.to_thread(db_load_tracked)
+    HOUSE_TOTAL_PAID_OUT = await asyncio.to_thread(db_load_house)
+    async with BALANCE_LOCK:
+        await sync_house_balance()
     print(f"📋 Loaded {len(TRACKED_PLAYERS)} tracked player(s) from Supabase "
           f"({len(PLAYER_DISCORD_IDS)} linked to Discord).")
 
