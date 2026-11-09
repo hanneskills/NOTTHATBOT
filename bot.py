@@ -3220,7 +3220,7 @@ async def russian_reactions(payload):
 # =================================================================
 # 10.10 GAMES — MINEFIELD (button grid)
 # =================================================================
-# !mines <amount> (alias !minefield): the bet is taken up front, then the
+# !minefield <amount> (alias !mines): the bet is taken up front, then the
 # starter reacts 1️⃣-9️⃣ to choose how many mines hide in a 5x5 grid of 25
 # buttons. Clicking a button reveals it: 💎 = safe, 💣 = mine (game over).
 # The starter can react ✅ at any time to cash out.
@@ -3538,7 +3538,7 @@ Earn points every Sunday: +1 per kill, +5 per top frag, +50 for the best kills/g
 `!blackjack <amount>` (`!bj`) — 🃏 hit · ✋ stand · 💰 double down; blackjack pays 2:1
 `!roulette <amount> <red|black|green>` (`!rl`) — everyone in the channel bets on one shared wheel; red/black pay 1:1, green pays 14:1, and a 0 (green) beats red/black
 `!russianroulette <amount>` (`!rr`, `!russian`) — 🔫 duel another player to the death, or play vs the revolver with rising payouts
-`!mines <amount>` (`!minefield`) — pick 1-9 mines with a reaction, then click tiles on a 5×5 grid; every safe tile raises your payout, react ✅ to cash out
+`!minefield <amount>` (`!mines`) — pick 1-9 mines with a reaction, then click tiles on a 5×5 grid; every safe tile raises your payout, react ✅ to cash out
 
 ℹ️ Bets are taken when you place them, payouts are rounded down to whole points, and you need a linked account to play."""
 
