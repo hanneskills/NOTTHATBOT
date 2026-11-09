@@ -32,7 +32,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.voice_states = True
 intents.members = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 ROLE_NAME      = "gamer"
 SIGNUP_CHANNEL = "general"
@@ -1789,11 +1789,9 @@ async def list_players(ctx):
         return
     lines = []
     for sid, name in TRACKED_PLAYERS.items():
-        discord_id = PLAYER_DISCORD_IDS.get(sid)
-        link_note = f" — <@{discord_id}>" if discord_id else ""
         bracket = PLAYER_RANK_BRACKET.get(sid)
         bracket_note = f" `[{bracket}]`" if bracket else ""
-        lines.append(f"• **{name}** — `{sid}`{link_note}{bracket_note}")
+        lines.append(f"• **{name}** — `{sid}`{bracket_note}")
     await ctx.send("**Tracked players:**\n" + "\n".join(lines))
 
 @bot.command(name="lastmatch")
@@ -3218,6 +3216,65 @@ async def russian_reactions(payload):
         elif emoji == RR_CASH:
             game["busy"] = True
             await _rr_bot_finish(game, mid, "cash")
+
+# =================================================================
+# 10.95 HELP
+# =================================================================
+# !help / !commands show a different message depending on the channel.
+# (Testing/maintenance commands such as !weeklyrecap, !testgetmatch,
+# !syncranks, !catchup, !getmatch and !lastmatch are intentionally not listed.)
+
+HELP_GAMBLING = """🎰 **Gambling Commands**
+
+💰 **Points**
+`!balance [@user]` (`!bal`) — check your points or someone else's
+`!transfer <amount> @user` — send points to another player
+
+Earn points every Sunday: +1 per kill, +5 per top frag, +50 for the best kills/game (min. 3 games).
+
+🎲 **Games**
+`!coinflip <amount>` (`!cf`) — pick heads or tails, then another player takes the other side or you flip vs the bot
+`!higherlower <amount>` (`!hilo`) — guess higher/lower on the next card; each correct guess raises the multiplier, ✅ cash out any time
+`!blackjack <amount>` (`!bj`) — 🃏 hit · ✋ stand · 💰 double down; blackjack pays 2:1
+`!roulette <amount> <red|black|green>` (`!rl`) — everyone in the channel bets on one shared wheel; red/black pay 1:1, green pays 14:1, and a 0 (green) beats red/black
+`!russianroulette <amount>` (`!rr`, `!russian`) — 🔫 duel another player to the death, or play vs the revolver with rising payouts
+
+ℹ️ Bets are taken when you place them, payouts are rounded down to whole points, and you need a linked account to play."""
+
+HELP_LEETIFY = """📊 **Tracking Players**
+
+`!addplayer <steam64id> [@discord_user] <display name>` — start tracking a player (the @mention is optional, but needed for rank roles and the casino)
+`!removeplayer <steam64id>` — stop tracking a player
+`!players` — list everyone being tracked
+
+Your Steam64 ID is the 17-digit number starting with 7656… (find it on steamid.io)."""
+
+HELP_BOT_CHANNEL = """🤖 **Bot Commands**
+
+📊 **Stats**
+`!players` — list tracked players
+`!stats <steam64id>` — show a player's stat card
+
+💰 **Economy**
+`!balance [@user]` (`!bal`) — check your points
+`!transfer <amount> @user` — send points to another player
+
+🎰 Games: see #gambling-commands
+📋 Tracking players: see #leetify"""
+
+HELP_BY_CHANNEL = {
+    "gambling-commands": HELP_GAMBLING,
+    "leetify":           HELP_LEETIFY,
+    "bot-channel":       HELP_BOT_CHANNEL,
+}
+
+@bot.command(name="help", aliases=["commands"])
+async def help_command(ctx):
+    """!help / !commands — show the commands that are relevant for this channel."""
+    text = HELP_BY_CHANNEL.get(getattr(ctx.channel, "name", ""))
+    if text is None:
+        text = "Use `!help` in #gambling-commands, #leetify or #bot-channel."
+    await ctx.send(text, allowed_mentions=discord.AllowedMentions.none())
 
 # =================================================================
 # 11. ON READY
