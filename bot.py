@@ -3220,7 +3220,7 @@ async def russian_reactions(payload):
 # =================================================================
 # 10.10 GAMES — MINEFIELD (button grid)
 # =================================================================
-# !minefield <amount> (alias !mines): the bet is taken up front, then the
+# !mines <amount> (alias !minefield): the bet is taken up front, then the
 # starter reacts 1️⃣-9️⃣ to choose how many mines hide in a 5x5 grid of 25
 # buttons. Clicking a button reveals it: 💎 = safe, 💣 = mine (game over).
 # The starter can react ✅ at any time to cash out.
@@ -3518,6 +3518,220 @@ async def mines_reactions(payload):
         await _mn_finish(game, "cash")
 
 # =================================================================
+# 10.11 GAMES — SLOTS
+# =================================================================
+# !slotmachine <amount> (alias !slots): 3 reels spin and land one by one.
+# Only THREE OF A KIND pays; two matching symbols pay nothing.
+#
+# Odds are exactly fair (zero-sum, 100% return, no house edge). Each reel
+# independently lands on a symbol with probability weight/total, so the chance
+# of three of symbol i is (w_i/total)^3 and the table below satisfies
+#   sum(w_i^3 * multiplier_i) == total^3
+# (checked by the assert at import time). All multipliers are whole numbers,
+# so payouts never need rounding.
+#
+# Multiplier = TOTAL returned per point bet (bet included), so a x50 triple
+# nets +49x. Bets are capped at SL_MAX_BET, which caps the largest payout at
+# SL_MAX_BET * 50. Roughly 12% of spins are a triple.
+#
+# After a spin the creator can react 🔁 to spin again with the same bet. One
+# machine per player: a new !slots closes an idle old one (but not a spinning
+# one). The 🔁 expires after SL_IDLE_TIMEOUT seconds.
+
+SL_SYMBOLS = [   # (emoji, weight, multiplier for three of a kind)
+    ("🍒", 16, 5),
+    ("🍋", 11, 16),
+    ("🔔", 5,  30),
+    ("💎", 3,  40),
+    ("7️⃣", 1,  50),
+]
+SL_TOTAL_WEIGHT = sum(w for _, w, _ in SL_SYMBOLS)
+assert sum(w ** 3 * m for _, w, m in SL_SYMBOLS) == SL_TOTAL_WEIGHT ** 3, \
+    "slot payouts must work out to exactly 100% return"
+SL_MULT     = {e: m for e, _, m in SL_SYMBOLS}
+SL_MAX_BET  = 20
+SL_REPEAT   = "🔁"
+SL_IDLE_TIMEOUT = 60
+SL_STOP_FRAMES  = (3, 6, 9)                        # frame on which each reel lands
+SL_DELAYS       = (0.6, 0.6, 0.7, 0.7, 0.7, 0.8, 0.9, 1.0)   # sleep after frames 1..8
+SLOTS        = {}    # message_id -> game dict
+SLOTS_ACTIVE = {}    # discord user id -> game dict
+
+def _sl_embed(game: dict, reels: list, status: str, color=None) -> discord.Embed:
+    embed = discord.Embed(title=f"🎰 Slots — {game['bet']:,} points",
+                          color=color or discord.Color.dark_purple())
+    embed.description = (
+        f"<@{game['creator_id']}>\n\n"
+        f"🎰 ┃ {reels[0]} ┃ {reels[1]} ┃ {reels[2]} ┃ 🎰\n\n"
+        f"{status}"
+    )
+    paytable = "  ".join(f"{e}{e}{e} ×{m}" for e, _, m in reversed(SL_SYMBOLS))
+    embed.add_field(name="Three of a kind pays (total returned)", value=paytable, inline=False)
+    embed.set_footer(text=f"Fair odds · two of a kind doesn't pay · max bet {SL_MAX_BET}")
+    return embed
+
+def _sl_close(game: dict):
+    game["state"] = "done"
+    if game["message"]:
+        SLOTS.pop(game["message"].id, None)
+    if SLOTS_ACTIVE.get(game["creator_id"]) is game:
+        SLOTS_ACTIVE.pop(game["creator_id"], None)
+    task = game.get("task")
+    if task and task is not asyncio.current_task():
+        task.cancel()
+
+def _sl_set_expire(game: dict):
+    old = game.get("task")
+    if old and old is not asyncio.current_task():
+        old.cancel()
+    game["task"] = asyncio.create_task(_sl_expire(game))
+
+async def _sl_expire(game: dict):
+    await asyncio.sleep(SL_IDLE_TIMEOUT)
+    if game["state"] != "idle":
+        return
+    _sl_close(game)
+    try:
+        await game["message"].clear_reactions()
+    except Exception as e:
+        print(f"[slots] expire: {e}")
+
+async def _sl_spin(game: dict) -> bool:
+    """Takes the bet, animates the reels, pays out. Caller sets state to
+    'spinning' first. Returns False (and goes back to 'idle') if the player
+    can't afford the bet."""
+    sid, bet, msg = game["sid"], game["bet"], game["message"]
+
+    old = game.get("task")
+    if old and old is not asyncio.current_task():
+        old.cancel()
+
+    if await adjust_balance(sid, -bet) is None:
+        game["state"] = "idle"
+        _sl_set_expire(game)
+        await _cf_notice(msg.channel.id,
+                         f"❌ <@{game['creator_id']}> not enough balance — you have **{PLAYER_BALANCE.get(sid, 0):,}**.")
+        return False
+
+    symbols = [e for e, _, _ in SL_SYMBOLS]
+    weights = [w for _, w, _ in SL_SYMBOLS]
+    final   = random.choices(symbols, weights=weights, k=3)
+    triple  = final[0] == final[1] == final[2]
+    payout  = bet * SL_MULT[final[0]] if triple else 0
+
+    try:
+        try:
+            await msg.clear_reactions()
+        except Exception as e:
+            print(f"[slots] clear reactions: {e}")
+
+        for frame in range(1, SL_STOP_FRAMES[-1] + 1):
+            shown = [final[i] if frame >= SL_STOP_FRAMES[i] else random.choice(symbols) for i in range(3)]
+            locked = sum(1 for s in SL_STOP_FRAMES if frame >= s)
+            status = "🎰 **Spinning…**" if locked == 0 else f"🎰 **Spinning…** ({locked}/3 locked)"
+            try:
+                await msg.edit(embed=_sl_embed(game, shown, status, discord.Color.gold()))
+            except Exception as e:
+                print(f"[slots] frame: {e}")
+            if frame - 1 < len(SL_DELAYS):
+                await asyncio.sleep(SL_DELAYS[frame - 1])
+    finally:
+        if payout:
+            await adjust_balance(sid, payout)
+
+    net = payout - bet
+    if triple:
+        status = (f"🎉 **Three {final[0]}!** ×{SL_MULT[final[0]]} — you win **{net:,}** "
+                  f"({payout:,} returned).")
+        color = discord.Color.green()
+    elif len({*final}) == 2:
+        status = f"😬 So close — two of a kind doesn't pay. You lose **{bet:,}**."
+        color = discord.Color.red()
+    else:
+        status = f"❌ No match — you lose **{bet:,}**."
+        color = discord.Color.red()
+    status += f"\nBalance: **{PLAYER_BALANCE.get(sid, 0):,}**  ·  react {SL_REPEAT} to spin again"
+
+    game["state"] = "idle"
+    try:
+        await msg.edit(embed=_sl_embed(game, final, status, color))
+        await msg.add_reaction(SL_REPEAT)
+    except Exception as e:
+        print(f"[slots] final: {e}")
+    _sl_set_expire(game)
+    return True
+
+@bot.command(name="slotmachine", aliases=["slots"])
+async def slots_command(ctx, amount: int):
+    """!slotmachine <amount> (alias !slots) — spin the slot machine."""
+    if amount <= 0:
+        await ctx.send("❌ Amount must be a positive whole number.")
+        return
+    if amount > SL_MAX_BET:
+        await ctx.send(f"❌ The maximum bet on slots is **{SL_MAX_BET}** points.")
+        return
+    sid = steam_id_for_discord(ctx.author.id)
+    if not sid:
+        await ctx.send("❌ You don't have a linked tracked player, so you have no balance.")
+        return
+    if PLAYER_BALANCE.get(sid, 0) < amount:
+        await ctx.send(f"❌ Not enough balance — you have **{PLAYER_BALANCE.get(sid, 0):,}**.")
+        return
+
+    old = SLOTS_ACTIVE.get(ctx.author.id)
+    if old is not None:
+        if old["state"] == "spinning":
+            await ctx.send("❌ Your slot machine is still spinning — wait for the result.")
+            return
+        # Idle machine waiting for a 🔁 — close it and start fresh.
+        _sl_close(old)
+        try:
+            await old["message"].clear_reactions()
+        except Exception:
+            pass
+
+    game = {
+        "creator_id": ctx.author.id, "sid": sid, "bet": amount,
+        "state": "spinning", "message": None, "task": None,
+    }
+    SLOTS_ACTIVE[ctx.author.id] = game   # claim the slot before any await
+    try:
+        msg = await ctx.send(embed=_sl_embed(game, ["❔", "❔", "❔"], "🎰 **Pulling the lever…**",
+                                             discord.Color.gold()))
+    except Exception as e:
+        print(f"[slots] open failed: {e}")
+        SLOTS_ACTIVE.pop(ctx.author.id, None)
+        return
+    game["message"] = msg
+    SLOTS[msg.id] = game
+    if not await _sl_spin(game):
+        # Lost the race for the balance between the check and the bet.
+        _sl_close(game)
+        try:
+            await msg.edit(embed=_sl_embed(game, ["❔", "❔", "❔"], "❌ Not enough balance.",
+                                           discord.Color.greyple()))
+        except Exception:
+            pass
+
+@bot.listen('on_raw_reaction_add')
+async def slots_reactions(payload):
+    if payload.user_id == bot.user.id:
+        return
+    game = SLOTS.get(payload.message_id)
+    if not game:
+        return
+    try:
+        await game["message"].remove_reaction(payload.emoji, discord.Object(id=payload.user_id))
+    except Exception:
+        pass
+    if payload.user_id != game["creator_id"] or game["state"] != "idle":
+        return
+    if str(payload.emoji) != SL_REPEAT:
+        return
+    game["state"] = "spinning"
+    await _sl_spin(game)
+
+# =================================================================
 # 10.95 HELP
 # =================================================================
 # !help / !commands show a different message depending on the channel.
@@ -3539,6 +3753,7 @@ Earn points every Sunday: +1 per kill, +5 per top frag, +50 for the best kills/g
 `!roulette <amount> <red|black|green>` (`!rl`) — everyone in the channel bets on one shared wheel; red/black pay 1:1, green pays 14:1, and a 0 (green) beats red/black
 `!russianroulette <amount>` (`!rr`, `!russian`) — 🔫 duel another player to the death, or play vs the revolver with rising payouts
 `!minefield <amount>` (`!mines`) — pick 1-9 mines with a reaction, then click tiles on a 5×5 grid; every safe tile raises your payout, react ✅ to cash out
+`!slotmachine <amount>` (`!slots`) — spin 3 reels (max bet 20); only three of a kind pays: 🍒 ×5 · 🍋 ×16 · 🔔 ×30 · 💎 ×40 · 7️⃣ ×50 (fair odds); react 🔁 to spin again
 
 ℹ️ Bets are taken when you place them, payouts are rounded down to whole points, and you need a linked account to play."""
 
