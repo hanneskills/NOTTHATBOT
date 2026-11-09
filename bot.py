@@ -1,7 +1,9 @@
 import os
 import re
 import random
+import math
 import unicodedata
+from fractions import Fraction
 import asyncio
 import discord
 import requests
@@ -2188,6 +2190,230 @@ async def coinflip_reactions(payload):
             return
         game["state"] = "resolving"
         await _cf_conclude(game, payload.message_id, user_id)
+
+# =================================================================
+# 10.6 GAMES — HIGHER OR LOWER
+# =================================================================
+# !hilo <amount>: the bot draws from a single shuffled 52-card deck (no
+# repeats, aces high) and shows a card. The starter guesses ⬆️ higher or
+# ⬇️ lower for the next card, and may ✅ cash out between guesses.
+#
+# Payouts are FAIR (no house edge): with H cards higher and L cards lower
+# left in the deck, a correct guess multiplies the pot by (H+L)/H (higher)
+# or (H+L)/L (lower). Equal ranks are a push (the new card becomes the
+# current one, pot unchanged), which keeps those odds exact. Because the
+# multiplier is computed from the real remaining deck, card counting gives
+# no advantage.
+#
+# Anti-abuse: the bet is taken up front (so walking away = a loss), one run
+# per player at a time, only the starter can click, the pot is tracked as an
+# exact fraction and the payout is rounded DOWN to whole points at the end
+# (rounding up would let people farm free points with 1-point bets on
+# near-certain guesses). An idle run auto-cashes out after HL_IDLE_TIMEOUT.
+
+HL_UP, HL_DOWN, HL_CASH = "⬆️", "⬇️", "✅"
+HL_IDLE_TIMEOUT = 120
+HL_SUITS = ["♥️", "♦️", "♣️", "♠️"]
+HL_RANK_LABELS = {11: "J", 12: "Q", 13: "K", 14: "A"}
+HILO = {}            # message_id -> game dict
+HILO_ACTIVE = set()  # discord user ids with a run in progress
+
+def _hl_label(card) -> str:
+    rank, suit = card
+    return f"{suit} **{HL_RANK_LABELS.get(rank, rank)}**"
+
+def _hl_counts(game):
+    cur = game["current"][0]
+    higher = sum(1 for r, _ in game["deck"] if r > cur)
+    lower  = sum(1 for r, _ in game["deck"] if r < cur)
+    return higher, lower
+
+def _hl_mult(total: int, part: int):
+    return Fraction(total, part) if part else None
+
+def _hl_fmt_mult(m) -> str:
+    if m is None:
+        return "—"
+    return f"×{math.floor(m * 100) / 100:.2f}"   # displayed rounded down, never overstated
+
+def _hl_embed(game, final_status: str | None = None, color=None) -> discord.Embed:
+    pot = math.floor(game["pot"])
+    embed = discord.Embed(title=f"🃏 Higher or Lower — {game['amount']:,} points",
+                          color=color or discord.Color.blurple())
+    history = "\n".join(game["history"])
+    if final_status:
+        embed.description = f"<@{game['creator_id']}>\n{final_status}\n\n**Steps:**\n{history}"
+    else:
+        higher, lower = _hl_counts(game)
+        total = higher + lower
+        embed.description = (
+            f"<@{game['creator_id']}>\n"
+            f"Current card: {_hl_label(game['current'])}\n"
+            f"Pot: **{pot:,}**\n\n"
+            f"{HL_UP} Higher {_hl_fmt_mult(_hl_mult(total, higher))}\n"
+            f"{HL_DOWN} Lower {_hl_fmt_mult(_hl_mult(total, lower))}\n"
+            f"{HL_CASH} Cash out **{pot:,}**\n\n"
+            f"**Steps so far:**\n{history}"
+        )
+        embed.set_footer(text=f"Idle for {HL_IDLE_TIMEOUT // 60} min = auto cash out · {len(game['deck'])} cards left")
+    return embed
+
+def _hl_reset_timer(message_id: int, game: dict):
+    old = game.get("task")
+    if old and old is not asyncio.current_task():
+        old.cancel()
+    game["task"] = asyncio.create_task(_hl_idle(message_id))
+
+async def _hl_idle(message_id: int):
+    await asyncio.sleep(HL_IDLE_TIMEOUT)
+    game = HILO.get(message_id)
+    if game and game["state"] == "active" and not game["busy"]:
+        game["busy"] = True
+        await _hl_finish(game, message_id, "idle")
+
+async def _hl_finish(game: dict, message_id: int, kind: str):
+    """kind: 'cash' | 'idle' | 'exhausted' (all pay out the pot) or 'lost'."""
+    game["state"] = "done"
+    HILO.pop(message_id, None)
+    HILO_ACTIVE.discard(game["creator_id"])
+    task = game.get("task")
+    if task and task is not asyncio.current_task():
+        task.cancel()
+
+    payout = 0
+    if kind != "lost":
+        payout = math.floor(game["pot"])
+        await adjust_balance(game["sid"], payout)
+    net = payout - game["amount"]
+
+    if kind == "lost":
+        status = f"💥 **Lost!** You lose your **{game['amount']:,}** bet."
+        color = discord.Color.red()
+    else:
+        prefix = {"cash": "💰 **Cashed out**", "idle": "⌛ **Idle — auto cashed out**",
+                  "exhausted": "🃏 **Deck ran out — cashed out**"}[kind]
+        status = f"{prefix} **{payout:,}** (net {net:+,})."
+        color = discord.Color.green() if net >= 0 else discord.Color.orange()
+    try:
+        await game["message"].edit(embed=_hl_embed(game, final_status=status, color=color))
+        await game["message"].clear_reactions()
+    except Exception as e:
+        print(f"[hilo] finish {message_id}: {e}")
+
+@bot.command(name="higherlower", aliases=["hilo"])
+async def higherlower_command(ctx, amount: int):
+    """!higherlower <amount> (alias !hilo) — start a higher/lower run."""
+    if amount <= 0:
+        await ctx.send("❌ Amount must be a positive whole number.")
+        return
+    sid = steam_id_for_discord(ctx.author.id)
+    if not sid:
+        await ctx.send("❌ You don't have a linked tracked player, so you have no balance.")
+        return
+    if ctx.author.id in HILO_ACTIVE:
+        await ctx.send("❌ You already have a Higher or Lower run going — finish it first.")
+        return
+
+    HILO_ACTIVE.add(ctx.author.id)   # claim the slot before any await
+    if await adjust_balance(sid, -amount) is None:
+        HILO_ACTIVE.discard(ctx.author.id)
+        await ctx.send(f"❌ Not enough balance — you have **{PLAYER_BALANCE.get(sid, 0):,}**.")
+        return
+
+    deck = [(r, s) for r in range(2, 15) for s in HL_SUITS]
+    random.shuffle(deck)
+    first = deck.pop()
+    game = {
+        "creator_id": ctx.author.id, "sid": sid, "amount": amount,
+        "pot": Fraction(amount), "deck": deck, "current": first,
+        "history": [f"🃏 Start: {_hl_label(first)}"],
+        "state": "active", "busy": False, "message": None, "task": None,
+    }
+    try:
+        msg = await ctx.send(embed=_hl_embed(game))
+        game["message"] = msg
+        HILO[msg.id] = game
+        for e in (HL_UP, HL_DOWN, HL_CASH):
+            await msg.add_reaction(e)
+    except Exception as e:
+        # Couldn't post the game — give the bet back.
+        print(f"[hilo] start failed: {e}")
+        HILO.pop(getattr(game["message"], "id", None), None)
+        HILO_ACTIVE.discard(ctx.author.id)
+        await adjust_balance(sid, amount)
+        return
+    _hl_reset_timer(msg.id, game)
+
+@bot.listen('on_raw_reaction_add')
+async def hilo_reactions(payload):
+    if payload.user_id == bot.user.id:
+        return
+    game = HILO.get(payload.message_id)
+    if not game:
+        return
+
+    msg = game["message"]
+    try:
+        await msg.remove_reaction(payload.emoji, discord.Object(id=payload.user_id))
+    except Exception:
+        pass
+
+    if payload.user_id != game["creator_id"]:
+        return
+    if game["state"] != "active" or game["busy"]:
+        return
+
+    emoji = str(payload.emoji)
+    if emoji not in (HL_UP, HL_DOWN, HL_CASH):
+        return
+
+    game["busy"] = True
+    message_id = payload.message_id
+
+    if emoji == HL_CASH:
+        await _hl_finish(game, message_id, "cash")
+        return
+
+    higher, lower = _hl_counts(game)
+    total = higher + lower
+    guess_up = (emoji == HL_UP)
+    if (guess_up and higher == 0) or (not guess_up and lower == 0):
+        game["busy"] = False
+        await _cf_notice(game["message"].channel.id,
+                         f"❌ <@{game['creator_id']}> no card can be {'higher' if guess_up else 'lower'} — pick the other option or cash out.")
+        return
+
+    try:
+        mult = _hl_mult(total, higher if guess_up else lower)
+        prev_label = _hl_label(game["current"])
+        prev_rank  = game["current"][0]
+        nxt = game["deck"].pop()
+        game["current"] = nxt
+        nxt_label = _hl_label(nxt)
+
+        if nxt[0] == prev_rank:
+            game["history"].append(f"{emoji} {prev_label} → {nxt_label} ➖ push (pot unchanged)")
+        elif (nxt[0] > prev_rank) == guess_up:
+            game["pot"] = game["pot"] * mult
+            game["history"].append(
+                f"{emoji} {prev_label} → {nxt_label} ✅ {_hl_fmt_mult(mult)} → pot {math.floor(game['pot']):,}"
+            )
+        else:
+            game["history"].append(f"{emoji} {prev_label} → {nxt_label} ❌ wrong")
+            await _hl_finish(game, message_id, "lost")
+            return
+
+        # Nothing left that could be higher/lower than the new card → end the run.
+        h2, l2 = _hl_counts(game)
+        if h2 + l2 == 0:
+            await _hl_finish(game, message_id, "exhausted")
+            return
+
+        await msg.edit(embed=_hl_embed(game))
+        _hl_reset_timer(message_id, game)
+    finally:
+        if game["state"] == "active":
+            game["busy"] = False
 
 # =================================================================
 # 11. ON READY
