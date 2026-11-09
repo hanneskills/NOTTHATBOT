@@ -1,5 +1,6 @@
 import os
 import re
+import random
 import unicodedata
 import asyncio
 import discord
@@ -1755,42 +1756,6 @@ async def transfer_command(ctx, amount: int, recipient: discord.Member):
         f"Your balance: **{PLAYER_BALANCE[from_sid]:,}**."
     )
 
-ONE_TIME_PAYOUT_USED = False
-
-@bot.command(name="payoutrecap")
-@commands.has_permissions(administrator=True)
-async def payout_recap(ctx, weeks_ago: int = 0):
-    """!payoutrecap [weeks_ago] — ONE-TIME catch-up: pays out balance for an
-    already-posted weekly recap (default 0 = the current week, same week
-    !weeklyrecap shows; use 1 for last week, e.g. after Monday 00:00 UTC) and
-    posts the Weekly Payouts embed in #weekly. Can only be used once per bot run;
-    remove this command after using it."""
-    global ONE_TIME_PAYOUT_USED
-    if ONE_TIME_PAYOUT_USED:
-        await ctx.send("❌ This one-time payout was already used.")
-        return
-    if weeks_ago < 0:
-        await ctx.send("❌ Weeks back can't be negative.")
-        return
-    leetify_channel = discord.utils.get(ctx.guild.text_channels, name=LEETIFY_CHANNEL_NAME)
-    weekly_channel  = discord.utils.get(ctx.guild.text_channels, name=WEEKLY_CHANNEL_NAME)
-    if not leetify_channel or not weekly_channel:
-        await ctx.send("❌ Need both a `#leetify` and a `#weekly` channel.")
-        return
-    async with ctx.typing():
-        stats = {}
-        embeds = await build_weekly_recap(leetify_channel, weeks_ago=weeks_ago, stats_out=stats)
-        payouts = compute_weekly_payouts(stats) if embeds else {}
-        if not payouts:
-            await ctx.send("📅 No payable matches found for that week — nothing paid.")
-            return
-        ONE_TIME_PAYOUT_USED = True
-        for sid, p in payouts.items():
-            await adjust_balance(sid, p["total"])
-        await weekly_channel.send(embed=build_payout_embed(payouts))
-    if ctx.channel != weekly_channel:
-        await ctx.send(f"✅ Paid out {len(payouts)} player(s); payouts posted in {weekly_channel.mention}.")
-
 @bot.command(name="syncranks")
 async def sync_ranks(ctx):
     """!syncranks — re-fetch every linked player's current rank and re-assign their
@@ -2010,6 +1975,219 @@ async def force_weekly_recap(ctx, weeks_ago: int = 0):
         else:
             await ctx.send(f"📅 No matches found in `#leetify` for {when_text}.")
 
+
+# =================================================================
+# 10.5 GAMES — COINFLIP
+# =================================================================
+# Flow: !cf <amount> posts a box. The creator picks a side with a reaction
+# (👑 heads / 🦅 tails). The box then offers: another player clicking the
+# opposite side's emoji to take the bet, or the creator clicking 🤖 to flip
+# against the bot, or ❌ to cancel. Stakes are only checked/taken at flip
+# time (no escrow); unaccepted boxes expire after COINFLIP_TIMEOUT seconds.
+# Vs a player: winner takes the pot (loser pays `amount` to the winner).
+# Vs the bot: win = +amount (minted), lose = -amount.
+
+COINFLIP_TIMEOUT = 120
+CF_HEADS, CF_TAILS, CF_BOT, CF_CANCEL = "👑", "🦅", "🤖", "❌"
+CF_SIDE_EMOJI = {"heads": CF_HEADS, "tails": CF_TAILS}
+COINFLIPS = {}   # message_id -> game dict
+
+def _cf_embed(game: dict, status: str, color=None) -> discord.Embed:
+    embed = discord.Embed(
+        title=f"🪙 Coinflip — {game['amount']:,} points",
+        description=status,
+        color=color or discord.Color.gold()
+    )
+    return embed
+
+def _cf_finish(message_id: int):
+    game = COINFLIPS.pop(message_id, None)
+    if game:
+        task = game.get("task")
+        if task and task is not asyncio.current_task():
+            task.cancel()
+
+async def _cf_expire(message_id: int):
+    await asyncio.sleep(COINFLIP_TIMEOUT)
+    game = COINFLIPS.get(message_id)
+    if not game or game["state"] not in ("pick", "open"):
+        return
+    game["state"] = "done"
+    COINFLIPS.pop(message_id, None)
+    try:
+        await game["message"].edit(embed=_cf_embed(
+            game, f"⌛ Expired — nobody took <@{game['creator_id']}>'s bet. Nothing was charged.",
+            discord.Color.greyple()
+        ))
+        await game["message"].clear_reactions()
+    except Exception as e:
+        print(f"[coinflip] expire {message_id}: {e}")
+
+async def _cf_resolve(creator_sid: str, opp_sid: str | None, amount: int, creator_side: str):
+    """Checks balances and flips under the balance lock. Returns
+    (error, result_side, creator_won); error is None, 'creator' or 'opponent'."""
+    async with BALANCE_LOCK:
+        if PLAYER_BALANCE.get(creator_sid, 0) < amount:
+            return "creator", None, None
+        if opp_sid is not None and PLAYER_BALANCE.get(opp_sid, 0) < amount:
+            return "opponent", None, None
+        result = random.choice(["heads", "tails"])
+        creator_won = (result == creator_side)
+        delta = amount if creator_won else -amount
+        PLAYER_BALANCE[creator_sid] = PLAYER_BALANCE.get(creator_sid, 0) + delta
+        touched = [creator_sid]
+        if opp_sid is not None:
+            PLAYER_BALANCE[opp_sid] = PLAYER_BALANCE.get(opp_sid, 0) - delta
+            touched.append(opp_sid)
+        for sid in touched:
+            if not await asyncio.to_thread(db_update_balance, sid, PLAYER_BALANCE[sid]):
+                print(f"[economy] Supabase write failed for {sid}.")
+        return None, result, creator_won
+
+async def _cf_notice(channel_id: int, text: str):
+    channel = bot.get_channel(channel_id)
+    if channel:
+        try:
+            await channel.send(text, delete_after=6)
+        except Exception:
+            pass
+
+async def _cf_conclude(game: dict, message_id: int, opp_id: int | None):
+    """Runs the flip (vs `opp_id`, or the bot if None) and edits the box."""
+    creator_sid = steam_id_for_discord(game["creator_id"])
+    opp_sid = steam_id_for_discord(opp_id) if opp_id is not None else None
+    err, result, creator_won = await _cf_resolve(creator_sid, opp_sid, game["amount"], game["side"])
+
+    if err == "opponent":
+        # Opponent can't cover it — let the box stay open for someone else.
+        game["state"] = "open"
+        await _cf_notice(game["channel_id"], f"❌ <@{opp_id}> doesn't have enough balance for this bet.")
+        return
+    if err == "creator":
+        game["state"] = "done"
+        _cf_finish(message_id)
+        await game["message"].edit(embed=_cf_embed(
+            game, f"❌ Cancelled — <@{game['creator_id']}> no longer has enough balance.",
+            discord.Color.red()
+        ))
+        await game["message"].clear_reactions()
+        return
+
+    game["state"] = "done"
+    _cf_finish(message_id)
+    winner_id = game["creator_id"] if creator_won else opp_id
+    opp_label = f"<@{opp_id}>" if opp_id is not None else "the bot 🤖"
+    if winner_id is None:   # bot won
+        outcome = f"🤖 The bot wins — <@{game['creator_id']}> loses **{game['amount']:,}**."
+    elif opp_id is None:    # creator beat the bot
+        outcome = f"🎉 <@{game['creator_id']}> wins **{game['amount']:,}** from the bot!"
+    else:
+        outcome = f"🎉 <@{winner_id}> wins **{game['amount']:,}** from <@{opp_id if creator_won else game['creator_id']}>!"
+    await game["message"].edit(embed=_cf_embed(
+        game,
+        f"<@{game['creator_id']}> picked {CF_SIDE_EMOJI[game['side']]} **{game['side'].title()}** vs {opp_label}\n"
+        f"The coin lands on {CF_SIDE_EMOJI[result]} **{result.title()}**!\n\n{outcome}",
+        discord.Color.green() if (creator_won or winner_id == opp_id) else discord.Color.red()
+    ))
+    await game["message"].clear_reactions()
+
+@bot.command(name="coinflip", aliases=["cf"])
+async def coinflip_command(ctx, amount: int):
+    """!coinflip <amount> (alias !cf) — start a coinflip box."""
+    if amount <= 0:
+        await ctx.send("❌ Amount must be a positive whole number.")
+        return
+    sid = steam_id_for_discord(ctx.author.id)
+    if not sid:
+        await ctx.send("❌ You don't have a linked tracked player, so you have no balance.")
+        return
+    if PLAYER_BALANCE.get(sid, 0) < amount:
+        await ctx.send(f"❌ Not enough balance — you have **{PLAYER_BALANCE.get(sid, 0):,}**.")
+        return
+
+    game = {
+        "creator_id": ctx.author.id, "amount": amount, "side": None, "state": "pick",
+        "channel_id": ctx.channel.id, "message": None, "task": None,
+    }
+    msg = await ctx.send(embed=_cf_embed(
+        game,
+        f"<@{ctx.author.id}>, pick your side:\n{CF_HEADS} Heads   {CF_TAILS} Tails   {CF_CANCEL} Cancel"
+    ))
+    game["message"] = msg
+    COINFLIPS[msg.id] = game
+    game["task"] = asyncio.create_task(_cf_expire(msg.id))
+    for e in (CF_HEADS, CF_TAILS, CF_CANCEL):
+        await msg.add_reaction(e)
+
+@bot.listen('on_raw_reaction_add')
+async def coinflip_reactions(payload):
+    if payload.user_id == bot.user.id:
+        return
+    game = COINFLIPS.get(payload.message_id)
+    if not game:
+        return
+
+    emoji = str(payload.emoji)
+    user_id = payload.user_id
+    is_creator = (user_id == game["creator_id"])
+    msg = game["message"]
+
+    async def drop_reaction():
+        try:
+            await msg.remove_reaction(payload.emoji, discord.Object(id=user_id))
+        except Exception:
+            pass
+
+    await drop_reaction()   # keep only the bot's reactions visible
+
+    state = game["state"]
+    if state not in ("pick", "open"):
+        return
+
+    # ── Cancel (creator only, either stage) ───────────────────────
+    if emoji == CF_CANCEL:
+        if not is_creator:
+            return
+        game["state"] = "done"
+        _cf_finish(payload.message_id)
+        await msg.edit(embed=_cf_embed(game, "🚫 Cancelled by the creator.", discord.Color.greyple()))
+        await msg.clear_reactions()
+        return
+
+    # ── Stage 1: creator picks a side ────────────────────────────
+    if state == "pick":
+        if not is_creator or emoji not in (CF_HEADS, CF_TAILS):
+            return
+        game["state"] = "open"   # set before any await-heavy work to block double picks
+        game["side"] = "heads" if emoji == CF_HEADS else "tails"
+        other = "tails" if game["side"] == "heads" else "heads"
+        await msg.edit(embed=_cf_embed(
+            game,
+            f"<@{game['creator_id']}> picked {CF_SIDE_EMOJI[game['side']]} **{game['side'].title()}**.\n\n"
+            f"• Anyone else: click {CF_SIDE_EMOJI[other]} to take **{other.title()}**\n"
+            f"• <@{game['creator_id']}>: click {CF_BOT} to flip against the bot, or {CF_CANCEL} to cancel\n\n"
+            f"Expires in {COINFLIP_TIMEOUT // 60} min."
+        ))
+        await msg.clear_reactions()
+        for e in (CF_SIDE_EMOJI[other], CF_BOT, CF_CANCEL):
+            await msg.add_reaction(e)
+        return
+
+    # ── Stage 2: someone joins, or creator picks the bot ─────────
+    other_emoji = CF_TAILS if game["side"] == "heads" else CF_HEADS
+    if emoji == CF_BOT:
+        if not is_creator:
+            return
+        game["state"] = "resolving"
+        await _cf_conclude(game, payload.message_id, None)
+    elif emoji == other_emoji:
+        if is_creator:
+            return
+        if not steam_id_for_discord(user_id):
+            await _cf_notice(game["channel_id"], f"❌ <@{user_id}> you need a linked tracked player to join.")
+            return
+        game["state"] = "resolving"
+        await _cf_conclude(game, payload.message_id, user_id)
 
 # =================================================================
 # 11. ON READY
