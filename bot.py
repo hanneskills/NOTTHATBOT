@@ -2825,6 +2825,336 @@ async def roulette_reactions(payload):
         await _rl_spin(game, payload.channel_id)
 
 # =================================================================
+# 10.9 GAMES — RUSSIAN ROULETTE
+# =================================================================
+# !russianroulette <amount> (aliases !rr, !russian) opens a box. Then either:
+#   • another player clicks 🔫 to join for the same amount → a DUEL starts
+#     immediately. The revolver has 6 chambers with ONE bullet hidden in a
+#     pre-set random chamber (no re-spin), so every pull is a step closer
+#     and a duel always ends within 6 pulls; each player has exactly a 50%
+#     chance. Players alternate pulling (🔫, only the player whose turn it
+#     is can click; auto-pulls after RR_TURN_TIMEOUT seconds). Whoever hits
+#     the bullet loses; the winner takes the pot.
+#   • the creator clicks 🤖 to play alone vs the revolver: same gun, but the
+#     player chooses after every survived pull to pull again (🔫) or cash
+#     out (💰). Payouts are fair: surviving k pulls pays 6/(6-k) x the bet
+#     (1.2x, 1.5x, 2x, 3x, 6x), rounded DOWN to whole points.
+# An unclaimed box auto-cancels (bet refunded) after RR_OPEN_TIMEOUT seconds.
+# Bets are taken up front; one Russian roulette per player at a time.
+
+RR_PULL, RR_BOT, RR_CANCEL, RR_CASH = "🔫", "🤖", "❌", "💰"
+RR_CHAMBERS      = 6
+RR_TURN_TIMEOUT  = 10    # duel: seconds before an auto-pull
+RR_OPEN_TIMEOUT  = 120   # unclaimed box: seconds before auto-cancel
+RR_BOT_IDLE      = 120   # vs-bot run: idle seconds before auto cash-out
+RUSSIAN = {}             # message_id -> game dict
+RR_ACTIVE = set()        # discord user ids currently in a game
+
+def _rr_mult(survived: int) -> Fraction:
+    return Fraction(RR_CHAMBERS, RR_CHAMBERS - survived)
+
+def _rr_fmt(m: Fraction) -> str:
+    return f"×{math.floor(m * 100) / 100:.2f}"
+
+def _rr_pot(game) -> int:
+    return math.floor(game["amount"] * _rr_mult(game["pulls"]))
+
+def _rr_embed(game, status: str | None = None, color=None) -> discord.Embed:
+    amount = game["amount"]
+    embed = discord.Embed(title=f"🔫 Russian Roulette — {amount:,} points",
+                          color=color or discord.Color.dark_red())
+    history = "\n".join(game["history"])
+    if status:
+        embed.description = f"{status}" + (f"\n\n{history}" if history else "")
+        return embed
+
+    if game["state"] == "open":
+        table = " · ".join(_rr_fmt(_rr_mult(k)) for k in range(1, RR_CHAMBERS))
+        embed.description = (
+            f"<@{game['creator_id']}> put **{amount:,}** on the table.\n\n"
+            f"**How it works:** a revolver with **1 bullet in {RR_CHAMBERS} chambers**.\n"
+            f"• **Duel:** another player clicks {RR_PULL} to match the bet. You take turns pulling the trigger "
+            f"(only on your turn, auto-pull after {RR_TURN_TIMEOUT}s). Whoever hits the bullet loses; "
+            f"the winner takes the pot (**{2 * amount:,}**).\n"
+            f"• **Vs bot:** <@{game['creator_id']}> clicks {RR_BOT} to pull alone. Each survived pull raises "
+            f"the payout ({table}) — pull again or cash out {RR_CASH} any time.\n"
+            f"• {RR_CANCEL} cancels (creator only).\n\n"
+            f"Cancels automatically <t:{game['expire_ts']}:R> if nobody joins."
+        )
+    elif game["mode"] == "duel":
+        cur = game["players"][game["turn"]]
+        a, b = game["players"]
+        embed.description = (
+            f"⚔️ **Duel:** <@{a}> vs <@{b}> — pot **{2 * amount:,}**\n\n"
+            f"{history}\n\n"
+            f"Turn: <@{cur}> — click {RR_PULL}, or it auto-pulls <t:{game['turn_ts']}:R>."
+        )
+    else:
+        k = game["pulls"]
+        pot = _rr_pot(game)
+        next_m = _rr_mult(k + 1)
+        embed.description = (
+            f"<@{game['creator_id']}> vs the revolver — bet **{amount:,}**\n\n"
+            f"{history}\n\n"
+            f"Survived: **{k}/{RR_CHAMBERS - 1}** · Pot now: **{pot:,}** ({_rr_fmt(_rr_mult(k))})\n"
+            f"{RR_PULL} Pull again — survive chance {RR_CHAMBERS - k - 1}/{RR_CHAMBERS - k}, pays {_rr_fmt(next_m)}\n"
+            f"{RR_CASH} Cash out **{pot:,}**"
+        )
+        embed.set_footer(text=f"Idle {RR_BOT_IDLE // 60} min = auto cash out")
+    return embed
+
+def _rr_set_timer(game: dict, coro):
+    old = game.get("task")
+    if old and old is not asyncio.current_task():
+        old.cancel()
+    game["task"] = asyncio.create_task(coro)
+
+def _rr_cleanup(game: dict, message_id: int):
+    game["state"] = "done"
+    RUSSIAN.pop(message_id, None)
+    for uid in game.get("players") or [game["creator_id"]]:
+        RR_ACTIVE.discard(uid)
+    RR_ACTIVE.discard(game["creator_id"])
+    task = game.get("task")
+    if task and task is not asyncio.current_task():
+        task.cancel()
+
+async def _rr_edit_final(game, embed):
+    try:
+        await game["message"].edit(embed=embed)
+        await game["message"].clear_reactions()
+    except Exception as e:
+        print(f"[russian] final edit: {e}")
+
+# ── Unclaimed box ──────────────────────────────────────────────────
+async def _rr_expire(message_id: int):
+    await asyncio.sleep(RR_OPEN_TIMEOUT)
+    game = RUSSIAN.get(message_id)
+    if not game or game["state"] != "open":
+        return
+    _rr_cleanup(game, message_id)
+    await adjust_balance(game["sid"], game["amount"])
+    await _rr_edit_final(game, _rr_embed(
+        game, status=f"⌛ Nobody joined — <@{game['creator_id']}>'s bet of **{game['amount']:,}** was refunded.",
+        color=discord.Color.greyple()))
+
+# ── Duel ───────────────────────────────────────────────────────────
+async def _rr_duel_turn_timer(message_id: int):
+    await asyncio.sleep(RR_TURN_TIMEOUT)
+    game = RUSSIAN.get(message_id)
+    if game and game["state"] == "active" and game["mode"] == "duel" and not game["busy"]:
+        game["busy"] = True
+        try:
+            await _rr_duel_pull(game, message_id, auto=True)
+        finally:
+            if game["state"] == "active":
+                game["busy"] = False
+
+async def _rr_duel_pull(game: dict, message_id: int, auto: bool = False):
+    cur = game["players"][game["turn"]]
+    other = game["players"][1 - game["turn"]]
+    idx = game["pulls"]
+    game["pulls"] += 1
+    tag = " *(auto)*" if auto else ""
+
+    if idx == game["bullet"]:
+        game["history"].append(f"💥 <@{cur}> pulls the trigger{tag} — **BANG!**")
+        _rr_cleanup(game, message_id)
+        payout = 2 * game["amount"]
+        await adjust_balance(game["sids"][other], payout)
+        await _rr_edit_final(game, _rr_embed(
+            game,
+            status=(f"💀 <@{cur}> is dead.\n🏆 <@{other}> wins **{game['amount']:,}** "
+                    f"(pot {payout:,})!"),
+            color=discord.Color.red()))
+        return
+
+    game["history"].append(f"🔫 <@{cur}> pulls the trigger{tag} — *click*. Safe.")
+    game["turn"] = 1 - game["turn"]
+    game["turn_ts"] = int(datetime.now(timezone.utc).timestamp()) + RR_TURN_TIMEOUT
+    await game["message"].edit(embed=_rr_embed(game))
+    _rr_set_timer(game, _rr_duel_turn_timer(message_id))
+
+# ── Vs bot ─────────────────────────────────────────────────────────
+async def _rr_bot_idle(message_id: int):
+    await asyncio.sleep(RR_BOT_IDLE)
+    game = RUSSIAN.get(message_id)
+    if game and game["state"] == "active" and game["mode"] == "bot" and not game["busy"]:
+        game["busy"] = True
+        await _rr_bot_finish(game, message_id, "idle")
+
+async def _rr_bot_finish(game: dict, message_id: int, kind: str):
+    """kind: 'died' | 'cash' | 'idle' | 'perfect'."""
+    _rr_cleanup(game, message_id)
+    if kind == "died":
+        await _rr_edit_final(game, _rr_embed(
+            game, status=f"💀 **BANG!** You lose **{game['amount']:,}**.", color=discord.Color.red()))
+        return
+    payout = _rr_pot(game)
+    await adjust_balance(game["sid"], payout)
+    net = payout - game["amount"]
+    prefix = {"cash": "💰 **Cashed out**", "idle": "⌛ **Idle — auto cashed out**",
+              "perfect": "🏆 **You survived every safe chamber — cashed out**"}[kind]
+    await _rr_edit_final(game, _rr_embed(
+        game, status=f"{prefix} **{payout:,}** ({_rr_fmt(_rr_mult(game['pulls']))}, net {net:+,}).",
+        color=discord.Color.green() if net > 0 else discord.Color.light_grey()))
+
+async def _rr_bot_pull(game: dict, message_id: int):
+    idx = game["pulls"]
+    if idx == game["bullet"]:
+        game["history"].append(f"💥 Pull {idx + 1}: **BANG!**")
+        await _rr_bot_finish(game, message_id, "died")
+        return
+    game["pulls"] += 1
+    game["history"].append(f"🔫 Pull {game['pulls']}: *click* — safe ({_rr_fmt(_rr_mult(game['pulls']))})")
+    if game["pulls"] >= RR_CHAMBERS - 1:
+        # Only the loaded chamber is left — pulling again would be certain death.
+        await _rr_bot_finish(game, message_id, "perfect")
+        return
+    await game["message"].edit(embed=_rr_embed(game))
+    _rr_set_timer(game, _rr_bot_idle(message_id))
+
+# ── Command + reactions ────────────────────────────────────────────
+@bot.command(name="russianroulette", aliases=["rr", "russian"])
+async def russian_command(ctx, amount: int):
+    """!russianroulette <amount> (aliases !rr, !russian) — open a Russian roulette box."""
+    if amount <= 0:
+        await ctx.send("❌ Amount must be a positive whole number.")
+        return
+    sid = steam_id_for_discord(ctx.author.id)
+    if not sid:
+        await ctx.send("❌ You don't have a linked tracked player, so you have no balance.")
+        return
+    if ctx.author.id in RR_ACTIVE:
+        await ctx.send("❌ You're already in a Russian roulette game.")
+        return
+
+    RR_ACTIVE.add(ctx.author.id)   # claim the slot before any await
+    if await adjust_balance(sid, -amount) is None:
+        RR_ACTIVE.discard(ctx.author.id)
+        await ctx.send(f"❌ Not enough balance — you have **{PLAYER_BALANCE.get(sid, 0):,}**.")
+        return
+
+    game = {
+        "creator_id": ctx.author.id, "sid": sid, "amount": amount,
+        "state": "open", "mode": None, "busy": False, "message": None, "task": None,
+        "players": None, "sids": {ctx.author.id: sid}, "turn": 0, "turn_ts": 0,
+        "bullet": random.randrange(RR_CHAMBERS), "pulls": 0, "history": [],
+        "expire_ts": int(datetime.now(timezone.utc).timestamp()) + RR_OPEN_TIMEOUT,
+    }
+    try:
+        msg = await ctx.send(embed=_rr_embed(game))
+        game["message"] = msg
+        RUSSIAN[msg.id] = game
+        for e in (RR_PULL, RR_BOT, RR_CANCEL):
+            await msg.add_reaction(e)
+    except Exception as e:
+        print(f"[russian] open failed: {e}")
+        RUSSIAN.pop(getattr(game["message"], "id", None), None)
+        RR_ACTIVE.discard(ctx.author.id)
+        await adjust_balance(sid, amount)
+        return
+    _rr_set_timer(game, _rr_expire(msg.id))
+
+@bot.listen('on_raw_reaction_add')
+async def russian_reactions(payload):
+    if payload.user_id == bot.user.id:
+        return
+    game = RUSSIAN.get(payload.message_id)
+    if not game:
+        return
+    msg = game["message"]
+    try:
+        await msg.remove_reaction(payload.emoji, discord.Object(id=payload.user_id))
+    except Exception:
+        pass
+    if game["busy"] or game["state"] in ("done", "starting"):
+        return
+
+    emoji = str(payload.emoji)
+    uid = payload.user_id
+    mid = payload.message_id
+    is_creator = (uid == game["creator_id"])
+
+    # ── Waiting for an opponent ───────────────────────────────────
+    if game["state"] == "open":
+        if emoji == RR_CANCEL and is_creator:
+            game["busy"] = True
+            _rr_cleanup(game, mid)
+            await adjust_balance(game["sid"], game["amount"])
+            await _rr_edit_final(game, _rr_embed(
+                game, status="🚫 Cancelled — bet refunded.", color=discord.Color.greyple()))
+
+        elif emoji == RR_BOT and is_creator:
+            game["busy"] = True
+            game["state"], game["mode"] = "active", "bot"
+            try:
+                await msg.clear_reactions()
+                await msg.edit(embed=_rr_embed(game))
+                await msg.add_reaction(RR_PULL)
+                await msg.add_reaction(RR_CASH)
+            except Exception as e:
+                print(f"[russian] bot start: {e}")
+            _rr_set_timer(game, _rr_bot_idle(mid))
+            game["busy"] = False
+
+        elif emoji == RR_PULL and not is_creator:
+            if uid in RR_ACTIVE:
+                await _cf_notice(msg.channel.id, f"❌ <@{uid}> you're already in a Russian roulette game.")
+                return
+            joiner_sid = steam_id_for_discord(uid)
+            if not joiner_sid:
+                await _cf_notice(msg.channel.id, f"❌ <@{uid}> you need a linked tracked player to join.")
+                return
+            game["state"] = "starting"   # block other joiners while we take the bet
+            RR_ACTIVE.add(uid)
+            if await adjust_balance(joiner_sid, -game["amount"]) is None:
+                RR_ACTIVE.discard(uid)
+                game["state"] = "open"
+                await _cf_notice(msg.channel.id,
+                                 f"❌ <@{uid}> not enough balance — you need **{game['amount']:,}**.")
+                return
+            game["sids"][uid] = joiner_sid
+            game["players"] = [game["creator_id"], uid]
+            random.shuffle(game["players"])   # random who pulls first (odds are 50/50 either way)
+            game["turn"] = 0
+            game["mode"] = "duel"
+            game["turn_ts"] = int(datetime.now(timezone.utc).timestamp()) + RR_TURN_TIMEOUT
+            game["state"] = "active"
+            try:
+                await msg.clear_reactions()
+                await msg.edit(embed=_rr_embed(game))
+                await msg.add_reaction(RR_PULL)
+            except Exception as e:
+                print(f"[russian] duel start: {e}")
+            _rr_set_timer(game, _rr_duel_turn_timer(mid))
+        return
+
+    # ── Duel in progress ──────────────────────────────────────────
+    if game["state"] == "active" and game["mode"] == "duel":
+        if emoji == RR_PULL and uid == game["players"][game["turn"]]:
+            game["busy"] = True
+            try:
+                await _rr_duel_pull(game, mid)
+            finally:
+                if game["state"] == "active":
+                    game["busy"] = False
+        return
+
+    # ── Solo vs the revolver ──────────────────────────────────────
+    if game["state"] == "active" and game["mode"] == "bot" and is_creator:
+        if emoji == RR_PULL:
+            game["busy"] = True
+            try:
+                await _rr_bot_pull(game, mid)
+            finally:
+                if game["state"] == "active":
+                    game["busy"] = False
+        elif emoji == RR_CASH:
+            game["busy"] = True
+            await _rr_bot_finish(game, mid, "cash")
+
+# =================================================================
 # 11. ON READY
 # =================================================================
 
