@@ -3218,6 +3218,306 @@ async def russian_reactions(payload):
             await _rr_bot_finish(game, mid, "cash")
 
 # =================================================================
+# 10.10 GAMES — MINEFIELD (button grid)
+# =================================================================
+# !mines <amount> (alias !minefield): the bet is taken up front, then the
+# starter reacts 1️⃣-9️⃣ to choose how many mines hide in a 5x5 grid of 25
+# buttons. Clicking a button reveals it: 💎 = safe, 💣 = mine (game over).
+# The starter can react ✅ at any time to cash out.
+#
+# Payouts are FAIR (no house edge), like hilo / russian roulette: with M mines
+# in 25 tiles, surviving k reveals in a row has probability
+#   prod_{i<k} (25-M-i)/(25-i)
+# so the multiplier after k safe tiles is the inverse of that. More mines =
+# bigger jumps per tile. The pot is an exact Fraction and the final payout is
+# rounded DOWN to whole points (so tiny bets can't farm free points).
+#
+# Only the starter can click; one minefield per player at a time; an idle
+# game auto-cashes out after MN_IDLE_TIMEOUT; an unstarted one (no mine count
+# picked) is cancelled and refunded after MN_PICK_TIMEOUT.
+
+MN_SIZE         = 25
+MN_COLS         = 5
+MN_CASH, MN_CANCEL = "✅", "❌"
+MN_NUM_EMOJI    = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣"]
+MN_SAFE_EMOJI   = "💎"
+MN_MINE_EMOJI   = "💣"
+MN_PICK_TIMEOUT = 120
+MN_IDLE_TIMEOUT = 120
+MINES        = {}    # message_id -> game dict
+MINES_ACTIVE = set() # discord user ids with a minefield in progress
+
+def _mn_mult(mines: int, k: int) -> Fraction:
+    """Fair multiplier after revealing k safe tiles in a row."""
+    m = Fraction(1)
+    for i in range(k):
+        m *= Fraction(MN_SIZE - i, MN_SIZE - mines - i)
+    return m
+
+def _mn_fmt(m: Fraction) -> str:
+    return f"×{math.floor(m * 100) / 100:.2f}"   # rounded down, never overstated
+
+def _mn_pot(game: dict, k: int | None = None) -> int:
+    k = len(game["revealed"]) if k is None else k
+    return math.floor(game["amount"] * _mn_mult(game["mines"], k))
+
+def _mn_embed(game: dict, final_status: str | None = None, color=None) -> discord.Embed:
+    embed = discord.Embed(title=f"💣 Minefield — {game['amount']:,} points",
+                          color=color or discord.Color.dark_orange())
+    if final_status:
+        embed.description = f"<@{game['creator_id']}>\n{final_status}"
+        return embed
+
+    if game["state"] == "pick":
+        table = "  ".join(f"{MN_NUM_EMOJI[n - 1]} {_mn_fmt(_mn_mult(n, 1))}" for n in range(1, 10))
+        embed.description = (
+            f"<@{game['creator_id']}>, how many mines should hide in the **5×5** grid?\n"
+            f"React with {MN_NUM_EMOJI[0]}–{MN_NUM_EMOJI[-1]}  ·  {MN_CANCEL} cancels (bet refunded).\n\n"
+            f"More mines = bigger payout per safe tile, but a bigger chance of blowing up.\n"
+            f"**Multiplier for the first safe tile:**\n{table}\n\n"
+            f"Cancels automatically <t:{game['pick_ts']}:R>."
+        )
+        return embed
+
+    k = len(game["revealed"])
+    safe_total = MN_SIZE - game["mines"]
+    cur, nxt = _mn_pot(game), _mn_pot(game, k + 1)
+    embed.description = (
+        f"<@{game['creator_id']}>\n"
+        f"Mines: **{game['mines']}** · Safe tiles found: **{k}/{safe_total}**\n\n"
+        f"💰 Current payout: **{cur:,}** ({_mn_fmt(_mn_mult(game['mines'], k))})\n"
+        f"➡️ If the next tile is safe: **{nxt:,}** ({_mn_fmt(_mn_mult(game['mines'], k + 1))})\n\n"
+        f"Click a tile below, or react {MN_CASH} to cash out **{cur:,}**."
+    )
+    embed.set_footer(text=f"Idle {MN_IDLE_TIMEOUT // 60} min = auto cash out")
+    return embed
+
+class MineButton(discord.ui.Button):
+    def __init__(self, game: dict, idx: int):
+        super().__init__(style=discord.ButtonStyle.secondary, label="?", row=idx // MN_COLS)
+        self.game = game
+        self.idx = idx
+
+    async def callback(self, interaction: discord.Interaction):
+        await _mn_click(self.game, self, interaction)
+
+class MinesView(discord.ui.View):
+    def __init__(self, game: dict):
+        super().__init__(timeout=None)
+        self.buttons = []
+        for i in range(MN_SIZE):
+            b = MineButton(game, i)
+            self.buttons.append(b)
+            self.add_item(b)
+
+def _mn_style_safe(button: MineButton):
+    button.label = None
+    button.emoji = MN_SAFE_EMOJI
+    button.style = discord.ButtonStyle.success
+    button.disabled = True
+
+def _mn_reveal_board(game: dict, lost: bool):
+    """Disables every button and shows what was hiding under them."""
+    for b in game["view"].buttons:
+        b.disabled = True
+        b.label = None
+        if b.idx in game["mine_set"]:
+            b.emoji = MN_MINE_EMOJI
+            b.style = discord.ButtonStyle.danger if lost else discord.ButtonStyle.secondary
+        elif b.idx in game["revealed"]:
+            b.emoji = MN_SAFE_EMOJI
+            b.style = discord.ButtonStyle.success
+        else:
+            b.emoji = MN_SAFE_EMOJI
+            b.style = discord.ButtonStyle.secondary
+
+def _mn_cleanup(game: dict):
+    game["state"] = "done"
+    if game["message"]:
+        MINES.pop(game["message"].id, None)
+    MINES_ACTIVE.discard(game["creator_id"])
+    task = game.get("task")
+    if task and task is not asyncio.current_task():
+        task.cancel()
+
+def _mn_reset_timer(game: dict):
+    old = game.get("task")
+    if old and old is not asyncio.current_task():
+        old.cancel()
+    game["task"] = asyncio.create_task(_mn_idle(game))
+
+async def _mn_idle(game: dict):
+    await asyncio.sleep(MN_IDLE_TIMEOUT)
+    if game["state"] == "active" and not game["busy"]:
+        game["busy"] = True
+        await _mn_finish(game, "idle")
+
+async def _mn_pick_expire(game: dict):
+    await asyncio.sleep(MN_PICK_TIMEOUT)
+    if game["state"] != "pick" or game["busy"]:
+        return
+    _mn_cleanup(game)
+    await adjust_balance(game["sid"], game["amount"])
+    try:
+        await game["message"].edit(embed=_mn_embed(
+            game, f"⌛ No mine count chosen — <@{game['creator_id']}>'s bet of **{game['amount']:,}** was refunded.",
+            discord.Color.greyple()))
+        await game["message"].clear_reactions()
+    except Exception as e:
+        print(f"[mines] pick expire: {e}")
+
+async def _mn_finish(game: dict, kind: str, interaction: discord.Interaction | None = None):
+    """kind: 'cash' | 'idle' | 'perfect' (all pay out the pot) or 'lost'."""
+    _mn_cleanup(game)
+    k = len(game["revealed"])
+
+    payout = 0
+    if kind != "lost":
+        payout = _mn_pot(game)
+        await adjust_balance(game["sid"], payout)
+    net = payout - game["amount"]
+
+    if kind == "lost":
+        status = f"💥 **BOOM!** You hit a mine and lose **{game['amount']:,}**."
+        color = discord.Color.red()
+    else:
+        prefix = {"cash": "💰 **Cashed out**", "idle": "⌛ **Idle — auto cashed out**",
+                  "perfect": "🏆 **Board cleared — cashed out**"}[kind]
+        status = (f"{prefix} **{payout:,}** after {k} safe tile{'s' if k != 1 else ''} "
+                  f"({_mn_fmt(_mn_mult(game['mines'], k))}, net {net:+,}).")
+        color = discord.Color.green() if net > 0 else discord.Color.light_grey()
+
+    _mn_reveal_board(game, lost=(kind == "lost"))
+    embed = _mn_embed(game, final_status=status, color=color)
+    game["view"].stop()
+    try:
+        if interaction is not None and not interaction.response.is_done():
+            await interaction.response.edit_message(embed=embed, view=game["view"])
+        else:
+            await game["message"].edit(embed=embed, view=game["view"])
+        await game["message"].clear_reactions()
+    except Exception as e:
+        print(f"[mines] finish: {e}")
+
+async def _mn_click(game: dict, button: MineButton, interaction: discord.Interaction):
+    if interaction.user.id != game["creator_id"]:
+        await interaction.response.send_message("❌ This isn't your minefield.", ephemeral=True)
+        return
+    if game["state"] != "active" or game["busy"] or button.idx in game["revealed"]:
+        await interaction.response.defer()
+        return
+
+    game["busy"] = True
+    try:
+        if button.idx in game["mine_set"]:
+            await _mn_finish(game, "lost", interaction)
+            return
+
+        game["revealed"].add(button.idx)
+        _mn_style_safe(button)
+        if len(game["revealed"]) >= MN_SIZE - game["mines"]:
+            await _mn_finish(game, "perfect", interaction)
+            return
+
+        await interaction.response.edit_message(embed=_mn_embed(game), view=game["view"])
+        _mn_reset_timer(game)
+    finally:
+        if game["state"] == "active":
+            game["busy"] = False
+
+@bot.command(name="mines", aliases=["minefield"])
+async def mines_command(ctx, amount: int):
+    """!mines <amount> (alias !minefield) — play the minefield."""
+    if amount <= 0:
+        await ctx.send("❌ Amount must be a positive whole number.")
+        return
+    sid = steam_id_for_discord(ctx.author.id)
+    if not sid:
+        await ctx.send("❌ You don't have a linked tracked player, so you have no balance.")
+        return
+    if ctx.author.id in MINES_ACTIVE:
+        await ctx.send("❌ You already have a minefield going — finish it first.")
+        return
+
+    MINES_ACTIVE.add(ctx.author.id)   # claim the slot before any await
+    if await adjust_balance(sid, -amount) is None:
+        MINES_ACTIVE.discard(ctx.author.id)
+        await ctx.send(f"❌ Not enough balance — you have **{PLAYER_BALANCE.get(sid, 0):,}**.")
+        return
+
+    game = {
+        "creator_id": ctx.author.id, "sid": sid, "amount": amount,
+        "state": "pick", "busy": False, "message": None, "task": None, "view": None,
+        "mines": None, "mine_set": set(), "revealed": set(),
+        "pick_ts": int(datetime.now(timezone.utc).timestamp()) + MN_PICK_TIMEOUT,
+    }
+    try:
+        msg = await ctx.send(embed=_mn_embed(game))
+        game["message"] = msg
+        MINES[msg.id] = game
+        for e in (*MN_NUM_EMOJI, MN_CANCEL):
+            await msg.add_reaction(e)
+    except Exception as e:
+        # Couldn't post the game — give the bet back.
+        print(f"[mines] open failed: {e}")
+        MINES.pop(getattr(game["message"], "id", None), None)
+        MINES_ACTIVE.discard(ctx.author.id)
+        await adjust_balance(sid, amount)
+        return
+    game["task"] = asyncio.create_task(_mn_pick_expire(game))
+
+@bot.listen('on_raw_reaction_add')
+async def mines_reactions(payload):
+    if payload.user_id == bot.user.id:
+        return
+    game = MINES.get(payload.message_id)
+    if not game:
+        return
+    msg = game["message"]
+    try:
+        await msg.remove_reaction(payload.emoji, discord.Object(id=payload.user_id))
+    except Exception:
+        pass
+
+    if payload.user_id != game["creator_id"]:
+        return
+    if game["busy"] or game["state"] not in ("pick", "active"):
+        return
+    emoji = str(payload.emoji)
+
+    # ── Stage 1: choose the number of mines ───────────────────────
+    if game["state"] == "pick":
+        if emoji == MN_CANCEL:
+            game["busy"] = True
+            _mn_cleanup(game)
+            await adjust_balance(game["sid"], game["amount"])
+            try:
+                await msg.edit(embed=_mn_embed(game, "🚫 Cancelled — bet refunded.", discord.Color.greyple()))
+                await msg.clear_reactions()
+            except Exception as e:
+                print(f"[mines] cancel: {e}")
+        elif emoji in MN_NUM_EMOJI:
+            game["busy"] = True
+            game["mines"] = MN_NUM_EMOJI.index(emoji) + 1
+            game["mine_set"] = set(random.sample(range(MN_SIZE), game["mines"]))
+            game["view"] = MinesView(game)
+            game["state"] = "active"
+            try:
+                await msg.clear_reactions()
+                await msg.edit(embed=_mn_embed(game), view=game["view"])
+                await msg.add_reaction(MN_CASH)
+            except Exception as e:
+                print(f"[mines] start: {e}")
+            _mn_reset_timer(game)   # replaces the pick-expiry timer
+            game["busy"] = False
+        return
+
+    # ── Stage 2: cash out ─────────────────────────────────────────
+    if emoji == MN_CASH:
+        game["busy"] = True
+        await _mn_finish(game, "cash")
+
+# =================================================================
 # 10.95 HELP
 # =================================================================
 # !help / !commands show a different message depending on the channel.
@@ -3238,6 +3538,7 @@ Earn points every Sunday: +1 per kill, +5 per top frag, +50 for the best kills/g
 `!blackjack <amount>` (`!bj`) — 🃏 hit · ✋ stand · 💰 double down; blackjack pays 2:1
 `!roulette <amount> <red|black|green>` (`!rl`) — everyone in the channel bets on one shared wheel; red/black pay 1:1, green pays 14:1, and a 0 (green) beats red/black
 `!russianroulette <amount>` (`!rr`, `!russian`) — 🔫 duel another player to the death, or play vs the revolver with rising payouts
+`!mines <amount>` (`!minefield`) — pick 1-9 mines with a reaction, then click tiles on a 5×5 grid; every safe tile raises your payout, react ✅ to cash out
 
 ℹ️ Bets are taken when you place them, payouts are rounded down to whole points, and you need a linked account to play."""
 
