@@ -2054,6 +2054,28 @@ async def _cf_notice(channel_id: int, text: str):
         except Exception:
             pass
 
+async def _cf_animate(game: dict):
+    """Flip animation: the box alternates Heads/Tails, slowing down, before the
+    result is shown. (Balances are already settled; this is just for show.)"""
+    msg = game["message"]
+    try:
+        await msg.clear_reactions()
+    except Exception:
+        pass
+    side = random.choice(["heads", "tails"])
+    for delay in (0.6, 0.6, 0.7, 0.8, 0.9, 1.1, 1.3):
+        try:
+            await msg.edit(embed=_cf_embed(
+                game,
+                f"🪙 **The coin is in the air…**\n\n"
+                f"{CF_SIDE_EMOJI[side]}  **{side.title()}**",
+                discord.Color.gold()
+            ))
+        except Exception:
+            return
+        side = "tails" if side == "heads" else "heads"
+        await asyncio.sleep(delay)
+
 async def _cf_conclude(game: dict, message_id: int, opp_id: int | None):
     """Runs the flip (vs `opp_id`, or the bot if None) and edits the box."""
     creator_sid = steam_id_for_discord(game["creator_id"])
@@ -2085,6 +2107,7 @@ async def _cf_conclude(game: dict, message_id: int, opp_id: int | None):
         outcome = f"🎉 <@{game['creator_id']}> wins **{game['amount']:,}** from the bot!"
     else:
         outcome = f"🎉 <@{winner_id}> wins **{game['amount']:,}** from <@{opp_id if creator_won else game['creator_id']}>!"
+    await _cf_animate(game)
     await game["message"].edit(embed=_cf_embed(
         game,
         f"<@{game['creator_id']}> picked {CF_SIDE_EMOJI[game['side']]} **{game['side'].title()}** vs {opp_label}\n"
@@ -2671,6 +2694,21 @@ ROULETTES = {}   # channel_id -> wheel dict
 def _rl_slot_color(n: int) -> str:
     return "green" if n == 0 else ("red" if n <= 7 else "black")
 
+# Order of the slots around the wheel: green, then red/black alternating.
+RL_WHEEL = [0, 1, 8, 2, 9, 3, 10, 4, 11, 5, 12, 6, 13, 7, 14]
+RL_SQUARE = {"green": "🟩", "red": "🟥", "black": "⬛"}
+
+def _rl_strip(center: int, width: int = 9) -> str:
+    """A straight strip of colored squares (in real wheel order) with a pointer
+    marking the slot at `center`."""
+    half = width // 2
+    squares = "".join(
+        RL_SQUARE[_rl_slot_color(RL_WHEEL[(center + off) % len(RL_WHEEL)])]
+        for off in range(-half, half + 1)
+    )
+    filler = "▫️" * half
+    return f"{filler}🔻{filler}\n{squares}\n{filler}🔺{filler}"
+
 def _rl_embed(game, status: str | None = None, color=None) -> discord.Embed:
     embed = discord.Embed(title="🎡 Roulette", color=color or discord.Color.dark_red())
     lines = []
@@ -2711,13 +2749,25 @@ async def _rl_spin(game: dict, channel_id: int):
     msg = game["message"]
     try:
         await msg.clear_reactions()
-        await msg.edit(embed=_rl_embed(game, status="🎡 **Spinning…**", color=discord.Color.gold()))
     except Exception as e:
-        print(f"[roulette] pre-spin edit: {e}")
-    await asyncio.sleep(2)
+        print(f"[roulette] clear reactions: {e}")
 
+    # Decide the result first, then scroll the strip so it decelerates onto it.
     number = random.randint(0, 14)
     landed = _rl_slot_color(number)
+    target = RL_WHEEL.index(number)
+    steps  = [3, 3, 3, 2, 2, 2, 1, 1, 1, 1]
+    delays = [0.7, 0.7, 0.7, 0.8, 0.8, 0.9, 1.0, 1.1, 1.2, 1.4]
+    center = (target - sum(steps)) % len(RL_WHEEL)
+    for step, delay in zip(steps, delays):
+        center = (center + step) % len(RL_WHEEL)
+        try:
+            await msg.edit(embed=_rl_embed(
+                game, status=f"🎡 **Spinning…**\n\n{_rl_strip(center)}", color=discord.Color.gold()))
+        except Exception as e:
+            print(f"[roulette] spin frame: {e}")
+            break
+        await asyncio.sleep(delay)
     for uid, b in game["bets"].items():
         if b is None:
             continue
@@ -2732,7 +2782,8 @@ async def _rl_spin(game: dict, channel_id: int):
     try:
         await msg.edit(embed=_rl_embed(
             game,
-            status=f"🎡 The ball lands on {RL_COLOR_EMOJI[landed]} **{number}** ({landed})!",
+            status=(f"🎡 The ball lands on {RL_COLOR_EMOJI[landed]} **{number}** ({landed})!\n\n"
+                    f"{_rl_strip(target)}"),
             color=discord.Color.green() if landed == "green" else
                   (discord.Color.red() if landed == "red" else discord.Color.dark_grey())
         ))
@@ -2957,6 +3008,14 @@ async def _rr_duel_pull(game: dict, message_id: int, auto: bool = False):
     game["pulls"] += 1
     tag = " *(auto)*" if auto else ""
 
+    # A little suspense before the result.
+    try:
+        await game["message"].edit(embed=_rr_embed(
+            game, status=f"🔫 <@{cur}> raises the revolver to their head…{tag}", color=discord.Color.gold()))
+    except Exception:
+        pass
+    await asyncio.sleep(1.5)
+
     if idx == game["bullet"]:
         game["history"].append(f"💥 <@{cur}> pulls the trigger{tag} — **BANG!**")
         _rr_cleanup(game, message_id)
@@ -3001,6 +3060,12 @@ async def _rr_bot_finish(game: dict, message_id: int, kind: str):
 
 async def _rr_bot_pull(game: dict, message_id: int):
     idx = game["pulls"]
+    try:
+        await game["message"].edit(embed=_rr_embed(
+            game, status="🔫 You raise the revolver to your head…", color=discord.Color.gold()))
+    except Exception:
+        pass
+    await asyncio.sleep(1.5)
     if idx == game["bullet"]:
         game["history"].append(f"💥 Pull {idx + 1}: **BANG!**")
         await _rr_bot_finish(game, message_id, "died")
