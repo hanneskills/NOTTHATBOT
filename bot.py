@@ -2416,6 +2416,237 @@ async def hilo_reactions(payload):
             game["busy"] = False
 
 # =================================================================
+# 10.7 GAMES — BLACKJACK
+# =================================================================
+# !bj <amount> (or !blackjack): solo vs the dealer, fresh shuffled 52-card deck
+# per game. Reactions: 🃏 hit · ✋ stand · 💰 double down (first move only).
+# Dealer stands on all 17s. Payouts (total returned on a wager `bet`):
+#   blackjack (21 on the first two cards) 3x · win 2x · push 1x · loss 0.
+# Double down doubles the wager, draws exactly one card, then stands.
+# The wager is taken up front; one game per player at a time; an idle game
+# auto-stands after BJ_IDLE_TIMEOUT.
+
+BJ_HIT, BJ_STAND, BJ_DOUBLE = "🃏", "✋", "💰"
+BJ_IDLE_TIMEOUT = 120
+BLACKJACKS = {}      # message_id -> game dict
+BJ_ACTIVE = set()    # discord user ids with a game in progress
+
+def _bj_card_value(rank: int) -> int:
+    if rank == 14:
+        return 11
+    return min(rank, 10)
+
+def _bj_value(cards) -> tuple[int, bool]:
+    """Returns (best total, is_soft) — soft means an ace is still counted as 11."""
+    total = sum(_bj_card_value(r) for r, _ in cards)
+    aces = sum(1 for r, _ in cards if r == 14)
+    while total > 21 and aces:
+        total -= 10
+        aces -= 1
+    return total, aces > 0
+
+def _bj_hand_text(cards, hide_second=False) -> str:
+    if hide_second:
+        return f"{_hl_label(cards[0])}  ❓"
+    total, soft = _bj_value(cards)
+    return f"{'  '.join(_hl_label(c) for c in cards)}\n**{'Soft ' if soft and total <= 21 else ''}{total}**"
+
+def _bj_embed(game, final_status: str | None = None, color=None) -> discord.Embed:
+    embed = discord.Embed(title=f"♠️ Blackjack — {game['bet']:,} points",
+                          color=color or discord.Color.dark_green())
+    reveal = final_status is not None
+    embed.add_field(name="Dealer", value=_bj_hand_text(game["dealer"], hide_second=not reveal), inline=True)
+    embed.add_field(name="You", value=_bj_hand_text(game["player"]), inline=True)
+    if final_status:
+        embed.description = f"<@{game['creator_id']}>\n{final_status}"
+    else:
+        controls = f"{BJ_HIT} Hit   {BJ_STAND} Stand"
+        if len(game["player"]) == 2 and not game["doubled"]:
+            controls += f"   {BJ_DOUBLE} Double down (+{game['bet']:,})"
+        embed.description = f"<@{game['creator_id']}>\n{controls}"
+        embed.set_footer(text=f"Dealer stands on all 17s · idle {BJ_IDLE_TIMEOUT // 60} min = auto stand")
+    return embed
+
+def _bj_reset_timer(message_id: int, game: dict):
+    old = game.get("task")
+    if old and old is not asyncio.current_task():
+        old.cancel()
+    game["task"] = asyncio.create_task(_bj_idle(message_id))
+
+async def _bj_idle(message_id: int):
+    await asyncio.sleep(BJ_IDLE_TIMEOUT)
+    game = BLACKJACKS.get(message_id)
+    if game and game["state"] == "active" and not game["busy"]:
+        game["busy"] = True
+        await _bj_dealer_turn(game, message_id, note="⌛ Idle — auto stand.\n")
+
+async def _bj_finish(game: dict, message_id: int, outcome: str, note: str = ""):
+    """outcome: 'blackjack' | 'win' | 'push' | 'lose' | 'bust'."""
+    game["state"] = "done"
+    BLACKJACKS.pop(message_id, None)
+    BJ_ACTIVE.discard(game["creator_id"])
+    task = game.get("task")
+    if task and task is not asyncio.current_task():
+        task.cancel()
+
+    factor = {"blackjack": 3, "win": 2, "push": 1, "lose": 0, "bust": 0}[outcome]
+    payout = game["bet"] * factor
+    if payout:
+        await adjust_balance(game["sid"], payout)
+    net = payout - game["bet"]
+
+    text = {
+        "blackjack": f"🎉 **Blackjack!** You win **{net:,}**.",
+        "win":       f"✅ **You win!** +**{net:,}**.",
+        "push":      "➖ **Push** — your bet is returned.",
+        "lose":      f"❌ **Dealer wins.** You lose **{game['bet']:,}**.",
+        "bust":      f"💥 **Bust!** You lose **{game['bet']:,}**.",
+    }[outcome]
+    color = (discord.Color.green() if net > 0 else
+             discord.Color.light_grey() if net == 0 else discord.Color.red())
+    try:
+        await game["message"].edit(embed=_bj_embed(game, final_status=note + text, color=color))
+        await game["message"].clear_reactions()
+    except Exception as e:
+        print(f"[blackjack] finish {message_id}: {e}")
+
+async def _bj_dealer_turn(game: dict, message_id: int, note: str = ""):
+    while _bj_value(game["dealer"])[0] < 17:
+        game["dealer"].append(game["deck"].pop())
+    p = _bj_value(game["player"])[0]
+    d = _bj_value(game["dealer"])[0]
+    if d > 21 or p > d:
+        outcome = "win"
+    elif p == d:
+        outcome = "push"
+    else:
+        outcome = "lose"
+    await _bj_finish(game, message_id, outcome, note)
+
+@bot.command(name="blackjack", aliases=["bj"])
+async def blackjack_command(ctx, amount: int):
+    """!blackjack <amount> (alias !bj) — play a hand of blackjack vs the dealer."""
+    if amount <= 0:
+        await ctx.send("❌ Amount must be a positive whole number.")
+        return
+    sid = steam_id_for_discord(ctx.author.id)
+    if not sid:
+        await ctx.send("❌ You don't have a linked tracked player, so you have no balance.")
+        return
+    if ctx.author.id in BJ_ACTIVE:
+        await ctx.send("❌ You already have a blackjack game going — finish it first.")
+        return
+
+    BJ_ACTIVE.add(ctx.author.id)   # claim the slot before any await
+    if await adjust_balance(sid, -amount) is None:
+        BJ_ACTIVE.discard(ctx.author.id)
+        await ctx.send(f"❌ Not enough balance — you have **{PLAYER_BALANCE.get(sid, 0):,}**.")
+        return
+
+    deck = [(r, s) for r in range(2, 15) for s in HL_SUITS]
+    random.shuffle(deck)
+    game = {
+        "creator_id": ctx.author.id, "sid": sid, "bet": amount, "doubled": False,
+        "deck": deck, "player": [deck.pop(), deck.pop()], "dealer": [deck.pop(), deck.pop()],
+        "state": "active", "busy": True, "message": None, "task": None,
+    }
+
+    p_bj = _bj_value(game["player"])[0] == 21
+    d_bj = _bj_value(game["dealer"])[0] == 21
+    try:
+        if p_bj or d_bj:
+            # Naturals are settled immediately.
+            outcome = "push" if (p_bj and d_bj) else ("blackjack" if p_bj else "lose")
+            msg = await ctx.send(embed=_bj_embed(game, final_status="…"))
+            game["message"] = msg
+            BLACKJACKS[msg.id] = game
+            await _bj_finish(game, msg.id, outcome,
+                             note="Dealer has blackjack. " if d_bj and not p_bj else "")
+            return
+
+        msg = await ctx.send(embed=_bj_embed(game))
+        game["message"] = msg
+        BLACKJACKS[msg.id] = game
+        for e in (BJ_HIT, BJ_STAND, BJ_DOUBLE):
+            await msg.add_reaction(e)
+    except Exception as e:
+        # Couldn't post the game — give the wager back.
+        print(f"[blackjack] start failed: {e}")
+        if game["state"] == "active":
+            BLACKJACKS.pop(getattr(game["message"], "id", None), None)
+            BJ_ACTIVE.discard(ctx.author.id)
+            await adjust_balance(sid, amount)
+        return
+    game["busy"] = False
+    _bj_reset_timer(msg.id, game)
+
+@bot.listen('on_raw_reaction_add')
+async def blackjack_reactions(payload):
+    if payload.user_id == bot.user.id:
+        return
+    game = BLACKJACKS.get(payload.message_id)
+    if not game:
+        return
+
+    msg = game["message"]
+    try:
+        await msg.remove_reaction(payload.emoji, discord.Object(id=payload.user_id))
+    except Exception:
+        pass
+
+    if payload.user_id != game["creator_id"]:
+        return
+    if game["state"] != "active" or game["busy"]:
+        return
+
+    emoji = str(payload.emoji)
+    if emoji not in (BJ_HIT, BJ_STAND, BJ_DOUBLE):
+        return
+
+    game["busy"] = True
+    message_id = payload.message_id
+    try:
+        if emoji == BJ_STAND:
+            await _bj_dealer_turn(game, message_id)
+            return
+
+        if emoji == BJ_DOUBLE:
+            if len(game["player"]) != 2 or game["doubled"]:
+                return
+            if await adjust_balance(game["sid"], -game["bet"]) is None:
+                await _cf_notice(msg.channel.id,
+                                 f"❌ <@{game['creator_id']}> not enough balance to double down.")
+                return
+            game["bet"] *= 2
+            game["doubled"] = True
+            game["player"].append(game["deck"].pop())
+            if _bj_value(game["player"])[0] > 21:
+                await _bj_finish(game, message_id, "bust")
+            else:
+                await _bj_dealer_turn(game, message_id)
+            return
+
+        # Hit
+        game["player"].append(game["deck"].pop())
+        total = _bj_value(game["player"])[0]
+        if total > 21:
+            await _bj_finish(game, message_id, "bust")
+        elif total == 21:
+            await _bj_dealer_turn(game, message_id)   # 21 — stand automatically
+        else:
+            if len(game["player"]) == 3:
+                # Double down is no longer available — drop its reaction.
+                try:
+                    await msg.remove_reaction(BJ_DOUBLE, bot.user)
+                except Exception:
+                    pass
+            await msg.edit(embed=_bj_embed(game))
+            _bj_reset_timer(message_id, game)
+    finally:
+        if game["state"] == "active":
+            game["busy"] = False
+
+# =================================================================
 # 11. ON READY
 # =================================================================
 
