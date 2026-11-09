@@ -2647,6 +2647,184 @@ async def blackjack_reactions(payload):
             game["busy"] = False
 
 # =================================================================
+# 10.8 GAMES — ROULETTE (shared wheel, colors only)
+# =================================================================
+# !roulette <amount> <red|black|green> (alias !rl): the first command in a
+# channel opens a wheel and makes the caller its owner; later commands from
+# other players in that channel join the same wheel (one bet per player per
+# wheel). The owner clicks ▶️ to spin, otherwise it auto-spins
+# RL_AUTO_SPIN seconds after creation. One wheel per channel.
+#
+# Classic 15-slot wheel: 0 = green, 1-7 = red, 8-14 = black.
+#   red / black: 1:1 (bet returned + 1x) · green: 14:1 (bet returned + 14x)
+#   A 0 makes every red/black bet lose.
+# Bets are taken the moment they're placed.
+
+RL_AUTO_SPIN = 60
+RL_PLAY = "▶️"
+RL_COLOR_EMOJI  = {"red": "🔴", "black": "⚫", "green": "🟢"}
+RL_COLOR_ALIASES = {"red": "red", "r": "red", "black": "black", "b": "black",
+                    "green": "green", "g": "green"}
+RL_RETURN_FACTOR = {"red": 2, "black": 2, "green": 15}   # total returned per point bet
+ROULETTES = {}   # channel_id -> wheel dict
+
+def _rl_slot_color(n: int) -> str:
+    return "green" if n == 0 else ("red" if n <= 7 else "black")
+
+def _rl_embed(game, status: str | None = None, color=None) -> discord.Embed:
+    embed = discord.Embed(title="🎡 Roulette", color=color or discord.Color.dark_red())
+    lines = []
+    for uid, b in game["bets"].items():
+        if b is None:
+            continue
+        line = f"<@{uid}> — **{b['amount']:,}** on {RL_COLOR_EMOJI[b['color']]} {b['color']}"
+        if b.get("result"):
+            line += f"  {b['result']}"
+        lines.append(line)
+    pot = sum(b["amount"] for b in game["bets"].values() if b)
+    body = "\n".join(lines) if lines else "*No bets yet*"
+    if status:
+        embed.description = f"{status}\n\n**Bets:**\n{body}"
+    else:
+        embed.description = (
+            f"Owner: <@{game['owner_id']}> — click {RL_PLAY} to spin, or it spins <t:{game['spin_ts']}:R>.\n"
+            f"Join with `!roulette <amount> <red|black|green>` in this channel.\n\n"
+            f"**Bets ({len(lines)} · {pot:,} total):**\n{body}"
+        )
+        embed.set_footer(text="red/black 1:1 · green 14:1 · 0 (green) beats red/black")
+    return embed
+
+async def _rl_auto_spin(channel_id: int):
+    await asyncio.sleep(RL_AUTO_SPIN)
+    game = ROULETTES.get(channel_id)
+    if game and game["state"] == "open":
+        await _rl_spin(game, channel_id)
+
+async def _rl_spin(game: dict, channel_id: int):
+    if game["state"] != "open":
+        return
+    game["state"] = "spinning"
+    task = game.get("task")
+    if task and task is not asyncio.current_task():
+        task.cancel()
+
+    msg = game["message"]
+    try:
+        await msg.clear_reactions()
+        await msg.edit(embed=_rl_embed(game, status="🎡 **Spinning…**", color=discord.Color.gold()))
+    except Exception as e:
+        print(f"[roulette] pre-spin edit: {e}")
+    await asyncio.sleep(2)
+
+    number = random.randint(0, 14)
+    landed = _rl_slot_color(number)
+    for uid, b in game["bets"].items():
+        if b is None:
+            continue
+        if b["color"] == landed:
+            payout = b["amount"] * RL_RETURN_FACTOR[landed]
+            await adjust_balance(b["sid"], payout)
+            b["result"] = f"✅ +{payout - b['amount']:,}"
+        else:
+            b["result"] = f"❌ −{b['amount']:,}"
+
+    ROULETTES.pop(channel_id, None)
+    try:
+        await msg.edit(embed=_rl_embed(
+            game,
+            status=f"🎡 The ball lands on {RL_COLOR_EMOJI[landed]} **{number}** ({landed})!",
+            color=discord.Color.green() if landed == "green" else
+                  (discord.Color.red() if landed == "red" else discord.Color.dark_grey())
+        ))
+    except Exception as e:
+        print(f"[roulette] result edit: {e}")
+
+@bot.command(name="roulette", aliases=["rl"])
+async def roulette_command(ctx, amount: int, color: str):
+    """!roulette <amount> <red|black|green> (alias !rl) — open a wheel or join
+    the one in this channel."""
+    if amount <= 0:
+        await ctx.send("❌ Amount must be a positive whole number.")
+        return
+    color = RL_COLOR_ALIASES.get(color.lower())
+    if not color:
+        await ctx.send("❌ Pick a color: `red`, `black` or `green`.")
+        return
+    sid = steam_id_for_discord(ctx.author.id)
+    if not sid:
+        await ctx.send("❌ You don't have a linked tracked player, so you have no balance.")
+        return
+
+    channel_id = ctx.channel.id
+    game = ROULETTES.get(channel_id)
+
+    # ── Join an existing wheel ────────────────────────────────────
+    if game is not None:
+        if game["state"] != "open":
+            await ctx.send("⏳ The wheel is spinning — wait for the result, then open a new one.")
+            return
+        if ctx.author.id in game["bets"]:
+            await ctx.send("❌ You already have a bet on this wheel.")
+            return
+        game["bets"][ctx.author.id] = None   # claim the slot before any await
+        if await adjust_balance(sid, -amount) is None:
+            game["bets"].pop(ctx.author.id, None)
+            await ctx.send(f"❌ Not enough balance — you have **{PLAYER_BALANCE.get(sid, 0):,}**.")
+            return
+        if game["state"] != "open":
+            # Spin started while we were taking the bet — refund.
+            game["bets"].pop(ctx.author.id, None)
+            await adjust_balance(sid, amount)
+            await ctx.send("⏳ Too late — the wheel just started spinning. Bet refunded.")
+            return
+        game["bets"][ctx.author.id] = {"sid": sid, "amount": amount, "color": color}
+        try:
+            await game["message"].edit(embed=_rl_embed(game))
+            await ctx.message.add_reaction("✅")
+        except Exception as e:
+            print(f"[roulette] join edit: {e}")
+        return
+
+    # ── Open a new wheel ──────────────────────────────────────────
+    game = {
+        "owner_id": ctx.author.id, "state": "open", "message": None, "task": None,
+        "bets": {ctx.author.id: None},
+        "spin_ts": int(datetime.now(timezone.utc).timestamp()) + RL_AUTO_SPIN,
+    }
+    ROULETTES[channel_id] = game   # claim the channel's wheel before any await
+    if await adjust_balance(sid, -amount) is None:
+        ROULETTES.pop(channel_id, None)
+        await ctx.send(f"❌ Not enough balance — you have **{PLAYER_BALANCE.get(sid, 0):,}**.")
+        return
+    game["bets"][ctx.author.id] = {"sid": sid, "amount": amount, "color": color}
+    try:
+        msg = await ctx.send(embed=_rl_embed(game))
+        game["message"] = msg
+        await msg.add_reaction(RL_PLAY)
+    except Exception as e:
+        print(f"[roulette] open failed: {e}")
+        ROULETTES.pop(channel_id, None)
+        for b in game["bets"].values():
+            if b:
+                await adjust_balance(b["sid"], b["amount"])
+        return
+    game["task"] = asyncio.create_task(_rl_auto_spin(channel_id))
+
+@bot.listen('on_raw_reaction_add')
+async def roulette_reactions(payload):
+    if payload.user_id == bot.user.id:
+        return
+    game = ROULETTES.get(payload.channel_id)
+    if not game or not game["message"] or game["message"].id != payload.message_id:
+        return
+    try:
+        await game["message"].remove_reaction(payload.emoji, discord.Object(id=payload.user_id))
+    except Exception:
+        pass
+    if payload.user_id == game["owner_id"] and str(payload.emoji) == RL_PLAY:
+        await _rl_spin(game, payload.channel_id)
+
+# =================================================================
 # 11. ON READY
 # =================================================================
 
