@@ -11,6 +11,7 @@ from discord.ext import commands, tasks
 from threading import Thread
 from flask import Flask
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 
 # =================================================================
 # 1. MINI WEB SERVER (keeps Render service alive)
@@ -549,10 +550,12 @@ async def transfer_balance(from_sid: str, to_sid: str, amount: int) -> bool:
                 print(f"[economy] Supabase write failed for {sid}.")
         return True
 
-def compute_weekly_payouts(player_stats: dict) -> dict:
+def compute_weekly_payouts(player_stats: dict, total_matches: int = 0) -> dict:
     """player_stats: {display_name: {kills, games, topfrags, adr_sum, ...}}
-    Returns {steam_id: {"name", "kills", "topfrags", "best_kpg", "total"}} for
-    tracked players only. Ties for best K/G all receive the bonus."""
+    Returns {steam_id: {"name", "kills", "topfrags", "best_kpg", "assets", "total"}}
+    for tracked players only. Ties for best K/G all receive the bonus. "assets" is
+    the Sunday bonus from owned shop assets (see compute_asset_bonuses), included
+    in "total". `total_matches` = matches tracked that week."""
     name_to_sid = {name: sid for sid, name in TRACKED_PLAYERS.items()}
 
     eligible = {
@@ -574,7 +577,14 @@ def compute_weekly_payouts(player_stats: dict) -> dict:
         total = kill_pts + top_pts + kpg_pts
         if total > 0:
             payouts[sid] = {"name": name, "kills": kill_pts, "topfrags": top_pts,
-                            "best_kpg": kpg_pts, "total": total}
+                            "best_kpg": kpg_pts, "assets": 0, "total": total}
+
+    # Asset bonuses (can also pay players who didn't play, e.g. server-wide bonuses).
+    for sid, b in compute_asset_bonuses(player_stats, total_matches).items():
+        p = payouts.setdefault(sid, {"name": TRACKED_PLAYERS.get(sid, sid), "kills": 0,
+                                     "topfrags": 0, "best_kpg": 0, "assets": 0, "total": 0})
+        p["assets"] = b["total"]
+        p["total"] += b["total"]
     return payouts
 
 # Bracket thresholds used for the auto-assigned Discord rank roles. These are
@@ -1373,7 +1383,8 @@ def _join_capped(lines: list[str], limit: int = 1024) -> str:
 
 
 async def build_weekly_recap(channel: discord.TextChannel, weeks_ago: int = 0,
-                             stats_out: dict | None = None) -> list[discord.Embed] | None:
+                             stats_out: dict | None = None,
+                             meta_out: dict | None = None) -> list[discord.Embed] | None:
     """
     Scrapes messages in `channel` for one week's worth of bot match embeds, and
     returns a list of Weekly Recap embeds: [maps_embed, kills_embed, frags_embed].
@@ -1513,6 +1524,8 @@ async def build_weekly_recap(channel: discord.TextChannel, weeks_ago: int = 0,
     # Hand the aggregated per-player stats back to the caller (used for payouts).
     if stats_out is not None:
         stats_out.update(player_stats)
+    if meta_out is not None:
+        meta_out["matches"] = total   # matches tracked that week (used by asset bonuses)
 
     # ── Build embeds ────────────────────────────────────────────────
     # For a completed week, week_end is the *next* Monday 00:00 UTC — display
@@ -1634,14 +1647,26 @@ async def build_weekly_recap(channel: discord.TextChannel, weeks_ago: int = 0,
 def build_payout_embed(payouts: dict) -> discord.Embed:
     """The '💰 Weekly Payouts' embed shown after a weekly recap."""
     pay_embed = discord.Embed(title="💰 Weekly Payouts", color=discord.Color.green())
-    pay_lines = [f"`{_pad('PLAYER', 16)}{_rpad('KILLS', 6)}{_rpad('TOP', 5)}{_rpad('K/G', 5)}{_rpad('TOTAL', 7)}`"]
+    show_assets = any(p.get("assets", 0) for p in payouts.values())
+    if show_assets:   # extra column for asset bonuses, only once someone has one
+        pay_lines = [f"`{_pad('PLAYER', 13)}{_rpad('KILLS', 6)}{_rpad('TOP', 5)}{_rpad('K/G', 5)}"
+                     f"{_rpad('ASSET', 6)}{_rpad('TOTAL', 6)}`"]
+    else:
+        pay_lines = [f"`{_pad('PLAYER', 16)}{_rpad('KILLS', 6)}{_rpad('TOP', 5)}{_rpad('K/G', 5)}{_rpad('TOTAL', 7)}`"]
     for sid, p in sorted(payouts.items(), key=lambda x: x[1]["total"], reverse=True):
-        pay_lines.append(
-            f"`{_pad(p['name'], 16)}{_rpad(p['kills'], 6)}{_rpad(p['topfrags'], 5)}"
-            f"{_rpad(p['best_kpg'], 5)}{_rpad(p['total'], 7)}`"
-        )
+        if show_assets:
+            pay_lines.append(
+                f"`{_pad(p['name'], 13)}{_rpad(p['kills'], 6)}{_rpad(p['topfrags'], 5)}"
+                f"{_rpad(p['best_kpg'], 5)}{_rpad(p.get('assets', 0), 6)}{_rpad(p['total'], 6)}`"
+            )
+        else:
+            pay_lines.append(
+                f"`{_pad(p['name'], 16)}{_rpad(p['kills'], 6)}{_rpad(p['topfrags'], 5)}"
+                f"{_rpad(p['best_kpg'], 5)}{_rpad(p['total'], 7)}`"
+            )
     pay_embed.add_field(name="Points earned", value=_join_capped(pay_lines), inline=False)
-    pay_embed.set_footer(text="1/kill · 5/top frag · 50 for best K/G")
+    pay_embed.set_footer(text="1/kill · 5/top frag · 50 for best K/G"
+                              + (" · ASSET = shop asset bonuses" if show_assets else ""))
     return pay_embed
 
 
@@ -1663,10 +1688,11 @@ async def weekly_recap_task():
             # Matches are scraped from #leetify (where scoreboards get posted),
             # but the resulting recap embeds are posted to #weekly.
             stats = {}
-            embeds = await build_weekly_recap(leetify_channel, stats_out=stats)
+            meta = {}
+            embeds = await build_weekly_recap(leetify_channel, stats_out=stats, meta_out=meta)
             if embeds:
                 # Pay out this week's points and add a payout embed to the recap.
-                payouts = compute_weekly_payouts(stats)
+                payouts = compute_weekly_payouts(stats, total_matches=meta.get("matches", 0))
                 if payouts:
                     for sid, p in payouts.items():
                         await adjust_balance(sid, p["total"], paid_out=True)
@@ -3818,6 +3844,747 @@ async def slots_reactions(payload):
     await _sl_spin(game)
 
 # =================================================================
+# 10.6 ASSETS — SHOP, DAILY DIVIDENDS & WEEKLY BONUSES
+# =================================================================
+# Players spend points on CS-themed assets that pay a dividend every day.
+#   * Everything is managed in the #assets channel (ASSETS_CHANNEL_NAME).
+#   * A player holds at most MAX_ASSET_SLOTS assets (regular + shady share them).
+#   * The shop offers 4 items (cheap / mid / high / shady), restocked daily at
+#     22:00 Belgian time. Stock is limited; !reroll replaces the whole shop for
+#     ASSET_REROLL_COST points.
+#   * Every asset pays `daily` points at 22:00 Belgian time. Shady assets also
+#     roll a daily ban chance (banned = gone, can't be sold).
+#   * "Bonus" assets additionally pay at the Sunday weekly payout, based on the
+#     player's week (kill %, top frags, bottom frags, own games, server games),
+#     capped per week and pro-rated by how long the asset was owned that week.
+# Data lives in Supabase: `assets` (catalogue, edit freely), `holdings`
+# (what players own) and `shop_state` (the 4 current offers). All of it is
+# cached in memory and written through, like the balances.
+
+ASSETS_CHANNEL_NAME    = "assets"
+MAX_ASSET_SLOTS        = 2
+ALLOW_DUPLICATE_ASSETS = False      # can a player own the same asset twice?
+ASSET_REROLL_COST      = 50
+ASSET_ROLL_HOUR        = 22         # dividends + shop restock, in ASSET_TZ
+ASSET_CONFIRM_TIMEOUT  = 30
+ASSET_CATALOG_RELOAD_EVERY = 10     # minutes between automatic catalogue reloads
+SHOP_SLOTS = ["cheap", "mid", "high", "shady"]
+SLOT_LABEL = {
+    "cheap": "🟢 Cheap",
+    "mid":   "🔵 Mid-tier",
+    "high":  "🟣 High-tier",
+    "shady": "🔴 Shady",
+}
+
+try:
+    ASSET_TZ = ZoneInfo("Europe/Brussels")
+except Exception:                   # tzdata missing: fixed UTC+1 (no DST)
+    ASSET_TZ = timezone(timedelta(hours=1))
+
+ASSETS: dict = {}       # asset_id -> asset dict (the whole catalogue, incl. disabled)
+HOLDINGS: list = []     # active holdings: {id, sid, asset_id, price_paid, bought_at, last_paid_at}
+SHOP: dict = {}         # slot -> {"asset_id", "stock_left", "rolled_at"}
+SHOP_LOCK = asyncio.Lock()
+_ASSET_TICKS = 0
+
+# ── Time helpers ────────────────────────────────────────────────────
+
+def _parse_ts(value) -> datetime | None:
+    """Parses a Supabase timestamptz string into an aware datetime."""
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    s = str(value).strip().replace("Z", "+00:00")
+    m = re.match(r"^(.*?T\d{2}:\d{2}:\d{2})(\.\d+)?(.*)$", s)
+    if m:   # normalise the fraction to 6 digits so older Pythons can parse it
+        frac = m.group(2)[1:7].ljust(6, "0") if m.group(2) else ""
+        s = m.group(1) + ("." + frac if frac else "") + m.group(3)
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+def _iso(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).isoformat()
+
+def _last_roll_boundary(now: datetime) -> datetime:
+    """Most recent daily payout/restock moment (22:00 Belgian time), in UTC."""
+    local = now.astimezone(ASSET_TZ)
+    boundary = local.replace(hour=ASSET_ROLL_HOUR, minute=0, second=0, microsecond=0)
+    if local < boundary:
+        boundary -= timedelta(days=1)
+    return boundary.astimezone(timezone.utc)
+
+def _next_roll_boundary(now: datetime) -> datetime:
+    last_local = _last_roll_boundary(now).astimezone(ASSET_TZ)
+    nxt = (last_local + timedelta(days=1)).replace(hour=ASSET_ROLL_HOUR, minute=0, second=0, microsecond=0)
+    return nxt.astimezone(timezone.utc)
+
+# ── Supabase layer (blocking; call through asyncio.to_thread) ───────
+
+def _asset_from_row(row: dict) -> dict | None:
+    try:
+        def i(key, default=0):
+            v = row.get(key)
+            return default if v is None else int(v)
+        def f(key, default=0.0):
+            v = row.get(key)
+            return default if v is None else float(v)
+        asset = {
+            "id": str(row["id"]), "name": str(row["name"]),
+            "emoji": row.get("emoji") or "💼", "description": row.get("description") or "",
+            "tier": str(row["tier"]), "price": int(row["price"]), "daily": i("daily"),
+            "ban_chance": f("ban_chance"), "kill_pct": f("kill_pct"),
+            "per_topfrag": i("per_topfrag"), "per_bottomfrag": i("per_bottomfrag"),
+            "per_game": i("per_game"), "per_server_game": i("per_server_game"),
+            "weekly_cap": None if row.get("weekly_cap") is None else int(row["weekly_cap"]),
+            "sell_pct": f("sell_pct", 0.5), "stock": i("stock", 1), "weight": i("weight", 10),
+            "enabled": bool(row.get("enabled", True)),
+        }
+    except (KeyError, TypeError, ValueError) as e:
+        print(f"[assets] skipping bad catalogue row {row.get('id')!r}: {e}")
+        return None
+    if asset["tier"] not in SHOP_SLOTS or asset["price"] <= 0:
+        print(f"[assets] skipping {asset['id']!r}: bad tier/price")
+        return None
+    return asset
+
+def _holding_from_row(row: dict) -> dict | None:
+    bought = _parse_ts(row.get("bought_at"))
+    if bought is None:
+        return None
+    return {
+        "id": int(row["id"]), "sid": str(row["steam_id"]), "asset_id": str(row["asset_id"]),
+        "price_paid": int(row["price_paid"]), "bought_at": bought,
+        "last_paid_at": _parse_ts(row.get("last_paid_at")) or bought,
+    }
+
+def db_load_assets() -> dict | None:
+    try:
+        res = requests.get(f"{SUPABASE_URL}/rest/v1/assets?select=*",
+                           headers=get_supabase_headers(), timeout=10)
+        if res.status_code == 200:
+            out = {}
+            for row in res.json():
+                a = _asset_from_row(row)
+                if a:
+                    out[a["id"]] = a
+            return out
+        print(f"[Supabase] Failed to load assets: {res.status_code} {res.text}")
+    except Exception as e:
+        print(f"[Supabase] db_load_assets error: {e}")
+    return None
+
+def db_load_holdings() -> list | None:
+    try:
+        res = requests.get(f"{SUPABASE_URL}/rest/v1/holdings?status=eq.active&select=*&order=bought_at.asc",
+                           headers=get_supabase_headers(), timeout=10)
+        if res.status_code == 200:
+            return [h for h in (_holding_from_row(r) for r in res.json()) if h]
+        print(f"[Supabase] Failed to load holdings: {res.status_code} {res.text}")
+    except Exception as e:
+        print(f"[Supabase] db_load_holdings error: {e}")
+    return None
+
+def db_insert_holding(sid: str, asset_id: str, price_paid: int, now: datetime) -> dict | None:
+    try:
+        res = requests.post(
+            f"{SUPABASE_URL}/rest/v1/holdings",
+            headers={**get_supabase_headers(), "Prefer": "return=representation"},
+            json={"steam_id": sid, "asset_id": asset_id, "price_paid": int(price_paid),
+                  "status": "active", "bought_at": _iso(now), "last_paid_at": _iso(now)},
+            timeout=10)
+        if res.status_code in (200, 201):
+            rows = res.json()
+            if rows:
+                return _holding_from_row(rows[0])
+        print(f"[Supabase] Failed to insert holding: {res.status_code} {res.text}")
+    except Exception as e:
+        print(f"[Supabase] db_insert_holding error: {e}")
+    return None
+
+def db_update_holding(holding_id: int, fields: dict) -> bool:
+    try:
+        res = requests.patch(f"{SUPABASE_URL}/rest/v1/holdings?id=eq.{holding_id}",
+                             headers=get_supabase_headers(), json=fields, timeout=10)
+        return res.status_code in (200, 204)
+    except Exception as e:
+        print(f"[Supabase] db_update_holding error: {e}")
+        return False
+
+def db_load_shop() -> dict | None:
+    try:
+        res = requests.get(f"{SUPABASE_URL}/rest/v1/shop_state?select=*",
+                           headers=get_supabase_headers(), timeout=10)
+        if res.status_code == 200:
+            out = {}
+            for row in res.json():
+                rolled = _parse_ts(row.get("rolled_at"))
+                if row.get("slot") in SHOP_SLOTS and row.get("asset_id") and rolled:
+                    out[row["slot"]] = {"asset_id": str(row["asset_id"]),
+                                        "stock_left": int(row.get("stock_left") or 0),
+                                        "rolled_at": rolled}
+            return out
+        print(f"[Supabase] Failed to load shop_state: {res.status_code} {res.text}")
+    except Exception as e:
+        print(f"[Supabase] db_load_shop error: {e}")
+    return None
+
+def db_save_shop(rows: list) -> bool:
+    try:
+        res = requests.post(f"{SUPABASE_URL}/rest/v1/shop_state",
+                            headers={**get_supabase_headers(), "Prefer": "resolution=merge-duplicates"},
+                            json=rows, timeout=10)
+        return res.status_code in (200, 201, 204)
+    except Exception as e:
+        print(f"[Supabase] db_save_shop error: {e}")
+        return False
+
+def db_update_shop_slot(slot: str, fields: dict) -> bool:
+    try:
+        res = requests.patch(f"{SUPABASE_URL}/rest/v1/shop_state?slot=eq.{slot}",
+                             headers=get_supabase_headers(), json=fields, timeout=10)
+        return res.status_code in (200, 204)
+    except Exception as e:
+        print(f"[Supabase] db_update_shop_slot error: {e}")
+        return False
+
+async def reload_assets_catalog() -> bool:
+    """Re-reads the `assets` table (picks up edits made in Supabase)."""
+    global ASSETS
+    assets = await asyncio.to_thread(db_load_assets)
+    if assets is None:
+        return False            # keep the last good catalogue
+    ASSETS = assets
+    return True
+
+async def load_asset_data():
+    """Loads catalogue, holdings and shop state at startup."""
+    global HOLDINGS, SHOP
+    await reload_assets_catalog()
+    holdings = await asyncio.to_thread(db_load_holdings)
+    if holdings is not None:
+        HOLDINGS = holdings
+    shop = await asyncio.to_thread(db_load_shop)
+    if shop is not None:
+        SHOP = shop
+    print(f"🏢 Assets: {len(ASSETS)} catalogue item(s), {len(HOLDINGS)} active holding(s), "
+          f"{len(SHOP)} shop slot(s).")
+
+# ── Text helpers ────────────────────────────────────────────────────
+
+def asset_bonus_parts(a: dict) -> list[str]:
+    parts = []
+    if a["kill_pct"]:
+        parts.append(f"+{a['kill_pct'] * 100:g}% kill points")
+    if a["per_topfrag"]:
+        parts.append(f"+{a['per_topfrag']} per top frag")
+    if a["per_bottomfrag"]:
+        parts.append(f"+{a['per_bottomfrag']} per bottom frag")
+    if a["per_game"]:
+        parts.append(f"+{a['per_game']} per game you play")
+    if a["per_server_game"]:
+        parts.append(f"+{a['per_server_game']} per game the whole server plays")
+    return parts
+
+def asset_sell_value(price_paid: int, a: dict | None) -> int:
+    return int(price_paid * a["sell_pct"]) if a else 0
+
+def asset_details(a: dict) -> str:
+    """Stat lines shown under an item in the shop."""
+    lines = [f"💰 **{a['price']:,}** points · 📈 **{a['daily']:,}**/day"]
+    bonus = asset_bonus_parts(a)
+    if bonus:
+        cap = f" (max {a['weekly_cap']:,}/week)" if a["weekly_cap"] is not None else ""
+        lines.append("🎁 Sunday bonus: " + ", ".join(bonus) + cap)
+    if a["ban_chance"] > 0:
+        lines.append(f"⚠️ **{a['ban_chance'] * 100:g}%** daily ban chance "
+                     f"(avg. life ~{1 / a['ban_chance']:.0f} days)")
+    if a["sell_pct"] > 0:
+        lines.append(f"↩️ Sells back for {int(a['price'] * a['sell_pct']):,}")
+    else:
+        lines.append("🚫 Can't be sold")
+    return "\n".join(lines)
+
+def _fmt_player(sid: str) -> str:
+    return TRACKED_PLAYERS.get(sid, sid)
+
+# ── Shop state ──────────────────────────────────────────────────────
+
+def _weighted_pick(pool: list[dict]) -> dict | None:
+    if not pool:
+        return None
+    total = sum(a["weight"] for a in pool)
+    r = random.uniform(0, total)
+    acc = 0.0
+    for a in pool:
+        acc += a["weight"]
+        if r <= acc:
+            return a
+    return pool[-1]
+
+def _rollable(slot: str) -> list[dict]:
+    return [a for a in ASSETS.values()
+            if a["tier"] == slot and a["enabled"] and a["weight"] > 0 and a["stock"] > 0]
+
+async def _roll_shop(rolled_at: datetime):
+    """Rolls a fresh offer for every slot (never the same item twice in a row
+    when there is an alternative). Call while holding SHOP_LOCK."""
+    global SHOP
+    new = {}
+    for slot in SHOP_SLOTS:
+        pool = _rollable(slot)
+        current = SHOP.get(slot, {}).get("asset_id")
+        pick = _weighted_pick([a for a in pool if a["id"] != current] or pool)
+        if pick:
+            new[slot] = {"asset_id": pick["id"], "stock_left": pick["stock"], "rolled_at": rolled_at}
+    SHOP = new
+    rows = [{"slot": s,
+             "asset_id": new[s]["asset_id"] if s in new else None,
+             "stock_left": new[s]["stock_left"] if s in new else 0,
+             "rolled_at": _iso(rolled_at)} for s in SHOP_SLOTS]
+    if not await asyncio.to_thread(db_save_shop, rows):
+        print("[assets] Supabase write failed for shop_state.")
+
+def _shop_needs_roll(boundary: datetime) -> bool:
+    if not any(_rollable(s) for s in SHOP_SLOTS):
+        return False
+    if not SHOP:
+        return True
+    return min(e["rolled_at"] for e in SHOP.values()) < boundary
+
+def _dividends_due(boundary: datetime) -> bool:
+    return any((boundary - h["last_paid_at"]).total_seconds() > 0 for h in HOLDINGS)
+
+def build_shop_embed(title: str = "🛒 Asset Shop") -> discord.Embed:
+    nxt = _next_roll_boundary(datetime.now(timezone.utc))
+    embed = discord.Embed(
+        title=title,
+        description=(f"Restocks <t:{int(nxt.timestamp())}:R> (daily at {ASSET_ROLL_HOUR}:00). "
+                     f"`!buy <1-4>` to buy · `!reroll` ({ASSET_REROLL_COST} pts) for a new shop · "
+                     f"`!help` explains everything"),
+        color=discord.Color.gold())
+    for i, slot in enumerate(SHOP_SLOTS, 1):
+        entry = SHOP.get(slot)
+        a = ASSETS.get(entry["asset_id"]) if entry else None
+        if not a:
+            embed.add_field(name=f"{i}. {SLOT_LABEL[slot]}", value="Nothing on offer right now.", inline=False)
+            continue
+        stock = (f"📦 In stock: **{entry['stock_left']}**" if entry["stock_left"] > 0
+                 else "❌ **Sold out**")
+        embed.add_field(
+            name=f"{i}. {SLOT_LABEL[slot]} — {a['emoji']} {a['name']}",
+            value=f"*{a['description']}*\n{asset_details(a)}\n{stock}",
+            inline=False)
+    return embed
+
+# ── Daily tick: dividends, bans, restock ────────────────────────────
+
+async def _pay_dividends(boundary: datetime) -> tuple[dict, list]:
+    """Pays every holding for the time since it was last paid (a full day per
+    24h; the first, partial day is pro-rated) and rolls the ban chance of shady
+    assets once per day owed. Restart-safe: it pays what is owed since
+    `last_paid_at`, so a missed tick is caught up and nothing is paid twice.
+    Call while holding SHOP_LOCK. Returns ({sid: points_paid}, [ban dicts])."""
+    paid, bans = {}, []
+    for h in list(HOLDINGS):
+        a = ASSETS.get(h["asset_id"])
+        if a is None:
+            continue
+        owed = (boundary - h["last_paid_at"]).total_seconds() / 86400
+        if owed <= 0:
+            continue
+        if abs(owed - round(owed)) < 0.05:      # absorb DST hour / small drift
+            owed = float(round(owed))
+        pay, remaining, banned = 0.0, owed, False
+        while remaining > 1e-9:
+            step = min(1.0, remaining)
+            pay += a["daily"] * step                             # pay the day first,
+            if a["ban_chance"] > 0 and random.random() < 1 - (1 - a["ban_chance"]) ** step:
+                banned = True                                    # then roll the ban
+                break
+            remaining -= step
+        pay = int(pay + 0.5)
+        if banned:
+            HOLDINGS.remove(h)
+            if not await asyncio.to_thread(db_update_holding, h["id"],
+                                           {"status": "banned", "ended_at": _iso(boundary)}):
+                print(f"[assets] Supabase write failed for banned holding {h['id']}.")
+            bans.append({"sid": h["sid"], "asset": a,
+                         "days": max(0, (boundary - h["bought_at"]).days)})
+        else:
+            h["last_paid_at"] = boundary
+            if not await asyncio.to_thread(db_update_holding, h["id"], {"last_paid_at": _iso(boundary)}):
+                print(f"[assets] Supabase write failed for holding {h['id']}.")
+        if pay > 0:
+            paid[h["sid"]] = paid.get(h["sid"], 0) + pay
+    for sid, amount in paid.items():
+        await adjust_balance(sid, amount, paid_out=True)
+    return paid, bans
+
+async def _announce_in_assets(embeds: list):
+    for guild in bot.guilds:
+        channel = discord.utils.get(guild.text_channels, name=ASSETS_CHANNEL_NAME)
+        if not channel:
+            continue
+        for e in embeds:
+            try:
+                await channel.send(embed=e)
+            except discord.HTTPException as err:
+                print(f"[assets] {guild.name}: failed to post in #{ASSETS_CHANNEL_NAME}: {err}")
+                break
+
+async def run_daily_tick(boundary: datetime):
+    async with SHOP_LOCK:
+        paid, bans = await _pay_dividends(boundary)
+        restocked = False
+        if _shop_needs_roll(boundary):
+            await _roll_shop(boundary)
+            restocked = True
+    embeds = []
+    if paid:
+        lines = [f"`{_pad('PLAYER', 16)}{_rpad('PAID', 8)}`"]
+        for sid, amt in sorted(paid.items(), key=lambda x: x[1], reverse=True):
+            lines.append(f"`{_pad(_fmt_player(sid), 16)}{_rpad(f'+{amt:,}', 8)}`")
+        e = discord.Embed(title="💸 Daily Dividends", color=discord.Color.green())
+        e.add_field(name="Points paid out", value=_join_capped(lines), inline=False)
+        embeds.append(e)
+    if bans:
+        lines = []
+        for b in bans:
+            did = PLAYER_DISCORD_IDS.get(b["sid"])
+            who = f"<@{did}>" if did else f"**{_fmt_player(b['sid'])}**"
+            lines.append(f"{who}'s {b['asset']['emoji']} **{b['asset']['name']}** got banned "
+                         f"after {b['days']} day{'s' if b['days'] != 1 else ''}. It's gone for good.")
+        embeds.append(discord.Embed(title="🚨 VAC wave", description="\n".join(lines),
+                                    color=discord.Color.red()))
+    if restocked:
+        embeds.append(build_shop_embed("🛒 Fresh stock!"))
+    if embeds:
+        await _announce_in_assets(embeds)
+
+@tasks.loop(minutes=1)
+async def asset_daily_task():
+    """Every minute: pays dividends and restocks the shop once a day at 22:00
+    Belgian time (also catches up after a restart or downtime)."""
+    global _ASSET_TICKS
+    try:
+        _ASSET_TICKS += 1
+        if _ASSET_TICKS % ASSET_CATALOG_RELOAD_EVERY == 0:
+            await reload_assets_catalog()
+        boundary = _last_roll_boundary(datetime.now(timezone.utc))
+        if _dividends_due(boundary) or _shop_needs_roll(boundary):
+            await run_daily_tick(boundary)
+    except Exception as e:
+        print(f"[assets] daily task error: {e}")
+
+# ── Weekly (Sunday) bonuses ─────────────────────────────────────────
+
+def compute_asset_bonuses(player_stats: dict, total_matches: int, now: datetime | None = None) -> dict:
+    """Sunday bonus of every owned asset. Returns {sid: {"total", "items": [(name, pts)]}}.
+    Each asset's bonus is capped by weekly_cap, then pro-rated by how much of the
+    week (Monday 00:00 UTC until `now`) the owner held it."""
+    now = now or datetime.now(timezone.utc)
+    week_start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    span = (now - week_start).total_seconds()
+    out = {}
+    for h in HOLDINGS:
+        a = ASSETS.get(h["asset_id"])
+        if not a or not asset_bonus_parts(a):
+            continue
+        s = player_stats.get(TRACKED_PLAYERS.get(h["sid"], ""), {})
+        raw = (a["kill_pct"] * s.get("kills", 0) * POINTS_PER_KILL
+               + a["per_topfrag"] * s.get("topfrags", 0)
+               + a["per_bottomfrag"] * s.get("bottomfrags", 0)
+               + a["per_game"] * s.get("games", 0)
+               + a["per_server_game"] * total_matches)
+        if a["weekly_cap"] is not None:
+            raw = min(raw, a["weekly_cap"])
+        held_from = max(h["bought_at"], week_start)
+        frac = max(0.0, min(1.0, (now - held_from).total_seconds() / span)) if span > 0 else 1.0
+        pts = int(raw * frac + 0.5)
+        if pts > 0:
+            entry = out.setdefault(h["sid"], {"total": 0, "items": []})
+            entry["total"] += pts
+            entry["items"].append((a["name"], pts))
+    return out
+
+# ── Command helpers ─────────────────────────────────────────────────
+
+async def _assets_ctx(ctx, need_player: bool = True) -> str | None | bool:
+    """Guards a command: only in #assets and (optionally) for linked players.
+    Returns the caller's steam_id, True (allowed, no player needed) or None (already replied)."""
+    if getattr(ctx.channel, "name", "") != ASSETS_CHANNEL_NAME:
+        ch = discord.utils.get(ctx.guild.text_channels, name=ASSETS_CHANNEL_NAME) if ctx.guild else None
+        await ctx.send(f"❌ Asset commands only work in {ch.mention if ch else '#' + ASSETS_CHANNEL_NAME}.")
+        return None
+    if not need_player:
+        return True
+    sid = steam_id_for_discord(ctx.author.id)
+    if not sid:
+        await ctx.send("❌ You don't have a linked tracked player, so you can't own assets. "
+                       "Use `!linkdiscord` first.")
+        return None
+    return sid
+
+def _holdings_of(sid: str) -> list[dict]:
+    return sorted((h for h in HOLDINGS if h["sid"] == sid), key=lambda h: h["bought_at"])
+
+def _resolve_shop_slot(text: str) -> str | None:
+    t = text.strip().lower()
+    if t.isdigit():
+        i = int(t)
+        return SHOP_SLOTS[i - 1] if 1 <= i <= len(SHOP_SLOTS) else None
+    if t in SHOP_SLOTS:
+        return t
+    hits = [s for s in SHOP_SLOTS
+            if s in SHOP and t in ASSETS.get(SHOP[s]["asset_id"], {}).get("name", "").lower()]
+    return hits[0] if len(hits) == 1 else None
+
+def _resolve_owned(owned: list[dict], text: str) -> dict | None:
+    t = text.strip().lower()
+    if t.isdigit():
+        i = int(t)
+        return owned[i - 1] if 1 <= i <= len(owned) else None
+    hits = [h for h in owned if t in ASSETS.get(h["asset_id"], {}).get("name", "").lower()]
+    return hits[0] if len(hits) == 1 else None
+
+def _check_buy(sid: str, slot: str) -> tuple[dict | None, str | None]:
+    entry = SHOP.get(slot)
+    a = ASSETS.get(entry["asset_id"]) if entry else None
+    if not a:
+        return None, "❌ Nothing is on offer in that slot right now."
+    if entry["stock_left"] <= 0:
+        return None, f"❌ **{a['name']}** is sold out — new stock arrives at {ASSET_ROLL_HOUR}:00, or `!reroll`."
+    owned = _holdings_of(sid)
+    if len(owned) >= MAX_ASSET_SLOTS:
+        return None, (f"❌ You already hold {MAX_ASSET_SLOTS} assets. `!sell` one first "
+                      f"(see `!portfolio`).")
+    if not ALLOW_DUPLICATE_ASSETS and any(h["asset_id"] == a["id"] for h in owned):
+        return None, f"❌ You already own **{a['name']}**."
+    bal = PLAYER_BALANCE.get(sid, 0)
+    if bal < a["price"]:
+        return None, f"❌ Not enough balance — **{a['name']}** costs {a['price']:,}, you have {bal:,}."
+    return a, None
+
+async def _confirm(ctx, prompt: str) -> bool:
+    msg = await ctx.send(f"{prompt}\nReact ✅ to confirm or ❌ to cancel ({ASSET_CONFIRM_TIMEOUT}s).")
+    try:
+        await msg.add_reaction("✅")
+        await msg.add_reaction("❌")
+    except discord.HTTPException:
+        pass
+
+    def check(reaction, user):
+        return (user.id == ctx.author.id and reaction.message.id == msg.id
+                and str(reaction.emoji) in ("✅", "❌"))
+    try:
+        reaction, _ = await bot.wait_for("reaction_add", timeout=ASSET_CONFIRM_TIMEOUT, check=check)
+    except asyncio.TimeoutError:
+        try:
+            await msg.edit(content=f"{prompt}\n⌛ Expired.")
+        except discord.HTTPException:
+            pass
+        return False
+    return str(reaction.emoji) == "✅"
+
+# ── Commands ────────────────────────────────────────────────────────
+
+@bot.command(name="shop")
+async def shop_command(ctx):
+    """!shop — today's 4 offers."""
+    if not await _assets_ctx(ctx, need_player=False):
+        return
+    await ctx.send(embed=build_shop_embed())
+
+@bot.command(name="buy")
+async def buy_command(ctx, *, choice: str = None):
+    """!buy <1-4 | tier | name> — buy an offer from the shop."""
+    sid = await _assets_ctx(ctx)
+    if not sid:
+        return
+    if not choice:
+        await ctx.send("❌ Usage: `!buy <1-4>` (or a tier / name, e.g. `!buy shady`). See `!shop`.")
+        return
+    slot = _resolve_shop_slot(choice)
+    if slot is None:
+        await ctx.send("❌ I can't find that in the shop. Use `!shop` and pick a number from 1 to 4.")
+        return
+    a, err = _check_buy(sid, slot)
+    if err:
+        await ctx.send(err)
+        return
+    price = a["price"]
+    note = "" if a["sell_pct"] > 0 else " It can't be sold again."
+    if not await _confirm(ctx, f"Buy {a['emoji']} **{a['name']}** for **{price:,}** points?{note}"):
+        return
+    async with SHOP_LOCK:
+        a, err = _check_buy(sid, slot)          # the shop may have changed while confirming
+        if err:
+            await ctx.send(err)
+            return
+        if a["price"] != price:
+            await ctx.send("❌ The price changed while you were confirming. Try again.")
+            return
+        if await adjust_balance(sid, -price) is None:
+            await ctx.send("❌ Not enough balance.")
+            return
+        row = await asyncio.to_thread(db_insert_holding, sid, a["id"], price, datetime.now(timezone.utc))
+        if row is None:
+            await adjust_balance(sid, price)    # refund
+            await ctx.send("❌ Couldn't save your purchase — you were not charged. Try again.")
+            return
+        HOLDINGS.append(row)
+        entry = SHOP[slot]
+        entry["stock_left"] -= 1
+        if not await asyncio.to_thread(db_update_shop_slot, slot, {"stock_left": entry["stock_left"]}):
+            print("[assets] Supabase write failed for shop stock.")
+    embed = discord.Embed(
+        title=f"✅ Bought {a['emoji']} {a['name']}",
+        description=(f"{asset_details(a)}\n\nFirst payout at the next {ASSET_ROLL_HOUR}:00 "
+                     f"(pro-rated for today). Balance: **{PLAYER_BALANCE.get(sid, 0):,}**."),
+        color=discord.Color.green())
+    await ctx.send(embed=embed)
+
+@bot.command(name="sell")
+async def sell_command(ctx, *, choice: str = None):
+    """!sell <1-2 | name> — sell one of your assets back."""
+    sid = await _assets_ctx(ctx)
+    if not sid:
+        return
+    owned = _holdings_of(sid)
+    if not owned:
+        await ctx.send("❌ You don't own any assets.")
+        return
+    if not choice:
+        await ctx.send("❌ Usage: `!sell <1-2>` (or part of the name). See `!portfolio`.")
+        return
+    h = _resolve_owned(owned, choice)
+    if h is None:
+        await ctx.send("❌ I can't find that asset. Check the numbers in `!portfolio`.")
+        return
+    a = ASSETS.get(h["asset_id"])
+    refund = asset_sell_value(h["price_paid"], a)
+    name = f"{a['emoji']} **{a['name']}**" if a else "this asset"
+    if refund <= 0:
+        await ctx.send(f"❌ {name} can't be sold.")
+        return
+    if not await _confirm(ctx, f"Sell {name} for **{refund:,}** points? "
+                               f"You paid {h['price_paid']:,} and forfeit income since the last payout."):
+        return
+    async with SHOP_LOCK:
+        if h["id"] not in {x["id"] for x in HOLDINGS}:
+            await ctx.send("❌ That asset is already gone.")
+            return
+        if not await asyncio.to_thread(db_update_holding, h["id"],
+                                       {"status": "sold", "ended_at": _iso(datetime.now(timezone.utc))}):
+            await ctx.send("❌ Couldn't save the sale. Try again.")
+            return
+        HOLDINGS[:] = [x for x in HOLDINGS if x["id"] != h["id"]]
+        new_bal = await adjust_balance(sid, refund)
+    await ctx.send(f"💸 Sold {name} for **{refund:,}** points. Balance: **{new_bal:,}**.")
+
+@bot.command(name="portfolio", aliases=["pf", "inventory"])
+async def portfolio_command(ctx, member: discord.Member = None):
+    """!portfolio [@user] — your assets and income."""
+    if not await _assets_ctx(ctx, need_player=False):
+        return
+    target = member or ctx.author
+    sid = steam_id_for_discord(target.id)
+    if not sid:
+        who = "You don't" if target == ctx.author else f"{target.display_name} doesn't"
+        await ctx.send(f"❌ {who} have a linked tracked player.")
+        return
+    owned = _holdings_of(sid)
+    embed = discord.Embed(title=f"💼 {target.display_name}'s Assets", color=discord.Color.blurple())
+    if not owned:
+        embed.description = f"No assets yet. Check `!shop`! (0/{MAX_ASSET_SLOTS} slots)"
+        await ctx.send(embed=embed)
+        return
+    total_daily = 0
+    for i, h in enumerate(owned, 1):
+        a = ASSETS.get(h["asset_id"])
+        if not a:
+            embed.add_field(name=f"{i}. (removed asset)", value="This asset no longer exists.", inline=False)
+            continue
+        total_daily += a["daily"]
+        sell = (f"sells for {asset_sell_value(h['price_paid'], a):,}" if a["sell_pct"] > 0
+                else "can't be sold")
+        embed.add_field(
+            name=f"{i}. {a['emoji']} {a['name']}",
+            value=(f"{asset_details(a)}\nPaid {h['price_paid']:,} · {sell} · "
+                   f"owned since <t:{int(h['bought_at'].timestamp())}:R>"),
+            inline=False)
+    nxt = _next_roll_boundary(datetime.now(timezone.utc))
+    embed.set_footer(text=f"Slots {len(owned)}/{MAX_ASSET_SLOTS} · base income {total_daily:,}/day "
+                          f"(~{total_daily * 7:,}/week) · next payout {nxt.astimezone(ASSET_TZ):%H:%M}")
+    await ctx.send(embed=embed)
+
+@bot.command(name="catalog", aliases=["catalogue", "items"])
+async def catalog_command(ctx, tier: str = None):
+    """!catalog [tier] — everything that can show up in the shop."""
+    if not await _assets_ctx(ctx, need_player=False):
+        return
+    slots = SHOP_SLOTS
+    if tier:
+        if tier.lower() not in SHOP_SLOTS:
+            await ctx.send("❌ Tier must be one of: " + ", ".join(f"`{s}`" for s in SHOP_SLOTS) + ".")
+            return
+        slots = [tier.lower()]
+    embed = discord.Embed(
+        title="📖 Asset Catalogue",
+        description=("Only 4 of these are in the shop at a time (see `!shop`). "
+                     "🎁 = pays a Sunday bonus · ⚠️ = daily ban chance"),
+        color=discord.Color.blurple())
+    for slot in slots:
+        items = sorted((a for a in ASSETS.values() if a["tier"] == slot and a["enabled"]),
+                       key=lambda a: (a["price"], a["name"]))
+        if not items:
+            continue
+        lines = []
+        for a in items:
+            tags = ("🎁 " if asset_bonus_parts(a) else "") + (f"⚠️{a['ban_chance'] * 100:g}%/day " if a["ban_chance"] > 0 else "")
+            lines.append(f"{a['emoji']} **{a['name']}** — {a['price']:,} · {a['daily']:,}/day {tags}".rstrip())
+        value = "\n".join(lines)
+        if len(value) > 1024:
+            value = value[:1020] + "…"
+        embed.add_field(name=f"{SLOT_LABEL[slot]} ({len(items)})", value=value, inline=False)
+    await ctx.send(embed=embed)
+
+@bot.command(name="reroll")
+async def reroll_command(ctx):
+    """!reroll — pay ASSET_REROLL_COST points to replace the whole shop."""
+    sid = await _assets_ctx(ctx)
+    if not sid:
+        return
+    async with SHOP_LOCK:
+        if not any(_rollable(s) for s in SHOP_SLOTS):
+            await ctx.send("❌ There's nothing to roll right now.")
+            return
+        if await adjust_balance(sid, -ASSET_REROLL_COST) is None:
+            await ctx.send(f"❌ A reroll costs **{ASSET_REROLL_COST}** points — "
+                           f"you have {PLAYER_BALANCE.get(sid, 0):,}.")
+            return
+        await _roll_shop(datetime.now(timezone.utc))
+    await ctx.send(f"🔄 **{ctx.author.display_name}** paid {ASSET_REROLL_COST} points to reroll the shop!",
+                   embed=build_shop_embed("🛒 Rerolled shop"))
+
+@bot.command(name="reloadshop")
+async def reloadshop_command(ctx):
+    """!reloadshop — (admin) re-read the assets table after editing it in Supabase."""
+    if not await _assets_ctx(ctx, need_player=False):
+        return
+    if not ctx.author.guild_permissions.manage_guild:
+        await ctx.send("❌ You need the Manage Server permission for that.")
+        return
+    if await reload_assets_catalog():
+        await ctx.send(f"✅ Reloaded the catalogue: {len(ASSETS)} item(s).")
+    else:
+        await ctx.send("⚠️ Couldn't reload the catalogue — keeping the previous one.")
+
+# =================================================================
 # 10.95 HELP
 # =================================================================
 # !help / !commands show a different message depending on the channel.
@@ -3841,7 +4608,8 @@ Earn points every Sunday: +1 per kill, +5 per top frag, +50 for the best kills/g
 `!minefield <amount>` (`!mines`) — pick 1-9 mines with a reaction, then click tiles on a 5×5 grid; every safe tile raises your payout, react ✅ to cash out
 `!slotmachine <amount>` (`!slots`) — spin 3 reels (max bet 20); only three of a kind pays: 🍒 ×5 · 🍋 ×16 · 🔔 ×30 · 💎 ×40 · 7️⃣ ×50 (fair odds); react 🔁 to spin again
 
-ℹ️ Bets are taken when you place them, payouts are rounded down to whole points, and you need a linked account to play."""
+ℹ️ Bets are taken when you place them, payouts are rounded down to whole points, and you need a linked account to play.
+📈 Want a steady income? Buy assets in #assets."""
 
 HELP_LEETIFY = """📊 **Tracking Players**
 
@@ -3862,10 +4630,33 @@ HELP_BOT_CHANNEL = """🤖 **Bot Commands**
 `!transfer <amount> @user` — send points to another player
 
 🎰 Games: see #gambling-commands
+🏢 Assets & daily dividends: see #assets
 📋 Tracking players: see #leetify"""
+
+HELP_ASSETS = """🏢 **Assets & Dividends**
+
+Buy CS-themed businesses that pay you points every day. You can hold **2 assets** at a time (regular and shady count the same).
+
+🛒 **Commands** (only in #assets)
+`!shop` — today's 4 offers: 🟢 cheap · 🔵 mid · 🟣 high · 🔴 shady
+`!buy <1-4>` — buy an offer (also `!buy shady` or part of the name)
+`!sell <1-2>` — sell one of your assets back
+`!portfolio [@user]` (`!pf`) — your assets, income and sell values
+`!catalog [tier]` — everything that can show up in the shop
+`!reroll` — pay 50 points to replace the whole shop right now
+
+⏰ **How it works**
+• Every day at **22:00** (Belgian time) the shop restocks and all dividends are paid. Stock is limited (**1 per offer**), first come first served.
+• **Regular** assets pay a fixed daily dividend, forever. Selling gives back about half of what you paid, and you lose the income since the last payout.
+• 🔴 **Shady** assets pay much more, but every day there's a % chance they get **banned** (shown on the card). A banned asset is gone, and shady assets can't be sold.
+• 🎁 **Bonus** assets also pay extra at the Sunday payout, based on your week: % of your kill points, per top frag, per bottom frag, per game you play, or per game the whole server plays. Bonuses have a weekly cap and are pro-rated for the days you owned the asset that week.
+• Every asset pays something daily, so bonuses are a top-up.
+
+ℹ️ A new asset's first payout is pro-rated. You need a linked account to own assets."""
 
 HELP_BY_CHANNEL = {
     "gambling-commands": HELP_GAMBLING,
+    "assets":            HELP_ASSETS,
     "leetify":           HELP_LEETIFY,
     "bot-channel":       HELP_BOT_CHANNEL,
 }
@@ -3875,8 +4666,18 @@ async def help_command(ctx):
     """!help / !commands — show the commands that are relevant for this channel."""
     text = HELP_BY_CHANNEL.get(getattr(ctx.channel, "name", ""))
     if text is None:
-        text = "Use `!help` in #gambling-commands, #leetify or #bot-channel."
-    await ctx.send(text, allowed_mentions=discord.AllowedMentions.none())
+        text = "Use `!help` in #gambling-commands, #assets, #leetify or #bot-channel."
+    # Discord messages are limited to 2000 characters: split on line breaks if needed.
+    chunks, current = [], ""
+    for line in text.split("\n"):
+        if current and len(current) + len(line) + 1 > 2000:
+            chunks.append(current)
+            current = line
+        else:
+            current = f"{current}\n{line}" if current else line
+    chunks.append(current)
+    for chunk in chunks:
+        await ctx.send(chunk, allowed_mentions=discord.AllowedMentions.none())
 
 # =================================================================
 # 11. ON READY
@@ -3899,10 +4700,14 @@ async def on_ready():
     for guild in bot.guilds:
         await run_automatic_catchup(guild)
 
+    await load_asset_data()
+
     check_leetify_stats.start()
     reset_poll_at_3am.start()
     weekly_recap_task.start()
     midnight_catchup_task.start()
+    if not asset_daily_task.is_running():
+        asset_daily_task.start()
 
 # =================================================================
 # 12. RUN
