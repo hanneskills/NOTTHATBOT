@@ -3922,6 +3922,19 @@ def _next_roll_boundary(now: datetime) -> datetime:
     nxt = (last_local + timedelta(days=1)).replace(hour=ASSET_ROLL_HOUR, minute=0, second=0, microsecond=0)
     return nxt.astimezone(timezone.utc)
 
+# ── Esports org ranking ─────────────────────────────────────────────
+# An asset with a `rank` (1 = best) gets its price and daily payout calculated
+# here, ignoring the table's price/daily columns. Edit the ranks in the Supabase
+# `assets` table; the bot picks them up within ASSET_CATALOG_RELOAD_EVERY
+# minutes (or immediately with !reloadshop).
+RANK_PRICE_TOP, RANK_PRICE_STEP = 16500, 1000    # rank 1 costs 16,500, then -1,000 per rank
+RANK_DAILY_TOP, RANK_DAILY_STEP = 250, 10        # rank 1 pays 250/day, then -10 per rank
+RANK_ANNOUNCED: dict = {}                        # asset_id -> rank last announced in #assets
+
+def rank_price_and_daily(rank: int) -> tuple[int, int]:
+    return (max(1, RANK_PRICE_TOP - (rank - 1) * RANK_PRICE_STEP),
+            max(0, RANK_DAILY_TOP - (rank - 1) * RANK_DAILY_STEP))
+
 # ── Supabase layer (blocking; call through asyncio.to_thread) ───────
 
 def _asset_from_row(row: dict) -> dict | None:
@@ -3942,10 +3955,13 @@ def _asset_from_row(row: dict) -> dict | None:
             "weekly_cap": None if row.get("weekly_cap") is None else int(row["weekly_cap"]),
             "sell_pct": f("sell_pct", 0.5), "stock": i("stock", 1), "weight": i("weight", 10),
             "enabled": bool(row.get("enabled", True)),
+            "rank": None if row.get("rank") is None else int(row["rank"]),
         }
     except (KeyError, TypeError, ValueError) as e:
         print(f"[assets] skipping bad catalogue row {row.get('id')!r}: {e}")
         return None
+    if asset["rank"] is not None:
+        asset["price"], asset["daily"] = rank_price_and_daily(asset["rank"])
     if asset["tier"] not in SHOP_SLOTS or asset["price"] <= 0:
         print(f"[assets] skipping {asset['id']!r}: bad tier/price")
         return None
@@ -4058,7 +4074,42 @@ async def reload_assets_catalog() -> bool:
     if assets is None:
         return False            # keep the last good catalogue
     ASSETS = assets
+    await _check_rank_changes()
     return True
+
+def build_rank_embed(prev: dict | None = None, title: str = "🏆 Esports Org Ranking") -> discord.Embed:
+    """Ranked orgs with their price and daily payout. `prev` ({asset_id: old rank})
+    adds ▲/▼ movement markers."""
+    ranked = sorted((a for a in ASSETS.values() if a["rank"] is not None), key=lambda a: a["rank"])
+    embed = discord.Embed(title=title, color=discord.Color.gold())
+    if not ranked:
+        embed.description = "No ranked orgs right now."
+        return embed
+    lines = [f"`{_pad('#', 4)}{_pad('ORG', 19)}{_pad('', 4)}{_rpad('PRICE', 7)}{_rpad('PAYS', 7)}`"]
+    for a in ranked:
+        move = ""
+        if prev and a["id"] in prev and prev[a["id"]] != a["rank"]:
+            d = prev[a["id"]] - a["rank"]
+            move = f"{'▲' if d > 0 else '▼'}{abs(d)}"
+        price, pays = f"{a['price']:,}", f"{a['daily']}/d"
+        lines.append(f"`{_pad('#' + str(a['rank']), 4)}{_pad(a['name'], 19)}{_pad(move, 4)}"
+                     f"{_rpad(price, 7)}{_rpad(pays, 7)}`")
+    embed.add_field(name="Price and payout follow the ranking", value=_join_capped(lines), inline=False)
+    embed.set_footer(text="Owners' daily payouts follow the current rank.")
+    return embed
+
+async def _check_rank_changes():
+    """Announces new org rankings in #assets (once the ranks are consistent, i.e.
+    no duplicates while you're still editing them in Supabase)."""
+    global RANK_ANNOUNCED
+    ranks = {a["id"]: a["rank"] for a in ASSETS.values() if a["rank"] is not None}
+    if not RANK_ANNOUNCED:                      # first load: just remember the ranks
+        RANK_ANNOUNCED = ranks
+        return
+    if ranks == RANK_ANNOUNCED or len(set(ranks.values())) != len(ranks):
+        return                                  # unchanged, or edits still in progress
+    prev, RANK_ANNOUNCED = RANK_ANNOUNCED, ranks
+    await _announce_in_assets([build_rank_embed(prev, "📊 Org rankings updated")])
 
 async def load_asset_data():
     """Loads catalogue, holdings and shop state at startup."""
@@ -4095,6 +4146,8 @@ def asset_sell_value(price_paid: int, a: dict | None) -> int:
 def asset_details(a: dict) -> str:
     """Stat lines shown under an item in the shop."""
     lines = [f"💰 **{a['price']:,}** points · 📈 **{a['daily']:,}**/day"]
+    if a.get("rank") is not None:
+        lines.append(f"🏆 Current rank **#{a['rank']}** (price and payout follow the ranking)")
     bonus = asset_bonus_parts(a)
     if bonus:
         cap = f" (max {a['weekly_cap']:,}/week)" if a["weekly_cap"] is not None else ""
@@ -4536,7 +4589,7 @@ async def catalog_command(ctx, tier: str = None):
     embed = discord.Embed(
         title="📖 Asset Catalogue",
         description=("Only 4 of these are in the shop at a time (see `!shop`). "
-                     "🎁 = pays a Sunday bonus · ⚠️ = daily ban chance"),
+                     "🎁 = pays a Sunday bonus · ⚠️ = daily ban chance · 🏆 = current org rank"),
         color=discord.Color.blurple())
     for slot in slots:
         items = sorted((a for a in ASSETS.values() if a["tier"] == slot and a["enabled"]),
@@ -4545,13 +4598,22 @@ async def catalog_command(ctx, tier: str = None):
             continue
         lines = []
         for a in items:
-            tags = ("🎁 " if asset_bonus_parts(a) else "") + (f"⚠️{a['ban_chance'] * 100:g}%/day " if a["ban_chance"] > 0 else "")
+            tags = (("🎁 " if asset_bonus_parts(a) else "")
+                    + (f"⚠️{a['ban_chance'] * 100:g}%/day " if a["ban_chance"] > 0 else "")
+                    + (f"🏆#{a['rank']} " if a["rank"] is not None else ""))
             lines.append(f"{a['emoji']} **{a['name']}** — {a['price']:,} · {a['daily']:,}/day {tags}".rstrip())
         value = "\n".join(lines)
         if len(value) > 1024:
             value = value[:1020] + "…"
         embed.add_field(name=f"{SLOT_LABEL[slot]} ({len(items)})", value=value, inline=False)
     await ctx.send(embed=embed)
+
+@bot.command(name="ranks", aliases=["ranking"])
+async def ranks_command(ctx):
+    """!ranks — current esports org ranking with prices and payouts."""
+    if not await _assets_ctx(ctx, need_player=False):
+        return
+    await ctx.send(embed=build_rank_embed())
 
 @bot.command(name="reroll")
 async def reroll_command(ctx):
@@ -4643,6 +4705,7 @@ Buy CS-themed businesses that pay you points every day. You can hold **2 assets*
 `!sell <1-2>` — sell one of your assets back
 `!portfolio [@user]` (`!pf`) — your assets, income and sell values
 `!catalog [tier]` — everything that can show up in the shop
+`!ranks` — current esports org ranking with prices and payouts
 `!reroll` — pay 50 points to replace the whole shop right now
 
 ⏰ **How it works**
@@ -4650,6 +4713,7 @@ Buy CS-themed businesses that pay you points every day. You can hold **2 assets*
 • **Regular** assets pay a fixed daily dividend, forever. Selling gives back about half of what you paid, and you lose the income since the last payout.
 • 🔴 **Shady** assets pay much more, but every day there's a % chance they get **banned** (shown on the card). A banned asset is gone, and shady assets can't be sold.
 • 🎁 **Bonus** assets also pay extra at the Sunday payout, based on your week: % of your kill points, per top frag, per bottom frag, per game you play, or per game the whole server plays. Bonuses have a weekly cap and are pro-rated for the days you owned the asset that week.
+• 🏆 **Esports orgs** are priced by their current ranking: a better rank means a higher price and daily payout. When the ranking changes, the payout of everyone who owns an org changes with it.
 • Every asset pays something daily, so bonuses are a top-up.
 
 ℹ️ A new asset's first payout is pro-rated. You need a linked account to own assets."""
