@@ -477,7 +477,8 @@ def db_update_house(total_paid_out, house_balance):
             f"{SUPABASE_URL}/rest/v1/house",
             headers={**get_supabase_headers(), "Prefer": "resolution=merge-duplicates"},
             json={"id": 1, "total_paid_out": int(total_paid_out),
-                  "house_balance": int(house_balance)}, timeout=10
+                  "house_balance": int(house_balance),
+                  "assets_spent": int(HOUSE_ASSETS_SPENT)}, timeout=10
         )
         return res.status_code in (200, 201, 204)
     except Exception as e:
@@ -496,14 +497,17 @@ PLAYER_RANK_BRACKET = {}   # steam_id -> last-assigned bracket string
 #   +1 point per kill, +5 per top frag, +50 for the best kills/game.
 PLAYER_BALANCE = {}        # steam_id -> int balance
 BALANCE_LOCK   = asyncio.Lock()
-# House balance = (all-time weekly payouts) - (sum of all current player balances).
-# Stored in the `house` table (single row, id=1): total_paid_out, house_balance.
+# House balance = (all-time payouts incl. asset dividends) - (net points spent on
+# assets) - (sum of all current player balances), so only gambling moves it.
+# Stored in the `house` table (single row, id=1): total_paid_out, assets_spent,
+# house_balance.
 HOUSE_TOTAL_PAID_OUT = 0
+HOUSE_ASSETS_SPENT   = 0   # purchases + rerolls - sale refunds (see section 10.6)
 
 async def sync_house_balance():
     """Recomputes house_balance and writes it to Supabase. Call while holding
     BALANCE_LOCK (or at startup) so the numbers are consistent."""
-    house_balance = HOUSE_TOTAL_PAID_OUT - sum(PLAYER_BALANCE.values())
+    house_balance = HOUSE_TOTAL_PAID_OUT - HOUSE_ASSETS_SPENT - sum(PLAYER_BALANCE.values())
     if not await asyncio.to_thread(db_update_house, HOUSE_TOTAL_PAID_OUT, house_balance):
         print(f"[economy] Supabase write failed for house balance ({house_balance}).")
 POINTS_PER_KILL     = 1
@@ -519,12 +523,14 @@ def steam_id_for_discord(discord_id: int) -> str | None:
             return sid
     return None
 
-async def adjust_balance(steam_id: str, delta: int, paid_out: bool = False) -> int | None:
+async def adjust_balance(steam_id: str, delta: int, paid_out: bool = False,
+                         asset_spend: bool = False) -> int | None:
     """Adds `delta` (may be negative) to a player's balance and persists it.
-    Pass paid_out=True for weekly payouts so they count toward the house's
-    all-time total paid out. Returns the new balance, or None if it would go
-    below zero."""
-    global HOUSE_TOTAL_PAID_OUT
+    Pass paid_out=True for weekly payouts and dividends so they count toward the
+    house's all-time total paid out. Pass asset_spend=True for asset purchases,
+    rerolls and sale refunds, so that money is not counted as house income.
+    Returns the new balance, or None if it would go below zero."""
+    global HOUSE_TOTAL_PAID_OUT, HOUSE_ASSETS_SPENT
     async with BALANCE_LOCK:
         new = PLAYER_BALANCE.get(steam_id, 0) + delta
         if new < 0:
@@ -532,6 +538,8 @@ async def adjust_balance(steam_id: str, delta: int, paid_out: bool = False) -> i
         PLAYER_BALANCE[steam_id] = new
         if paid_out:
             HOUSE_TOTAL_PAID_OUT += delta
+        if asset_spend:
+            HOUSE_ASSETS_SPENT -= delta     # spending is positive, refunds negative
         if not await asyncio.to_thread(db_update_balance, steam_id, new):
             print(f"[economy] Supabase write failed for {steam_id} (balance {new}).")
         await sync_house_balance()
@@ -3856,7 +3864,9 @@ async def slots_reactions(payload):
 #     roll a daily ban chance (banned = gone, can't be sold).
 #   * "Bonus" assets additionally pay at the Sunday weekly payout, based on the
 #     player's week (kill %, top frags, bottom frags, own games, server games),
-#     capped per week and pro-rated by how long the asset was owned that week.
+#     optionally capped per week (weekly_cap; empty = no cap, which is how the
+#     catalogue is set up now) and pro-rated by how long the asset was owned
+#     that week.
 # Data lives in Supabase: `assets` (catalogue, edit freely), `holdings`
 # (what players own) and `shop_state` (the 4 current offers). All of it is
 # cached in memory and written through, like the balances.
@@ -3976,6 +3986,22 @@ def _holding_from_row(row: dict) -> dict | None:
         "price_paid": int(row["price_paid"]), "bought_at": bought,
         "last_paid_at": _parse_ts(row.get("last_paid_at")) or bought,
     }
+
+def db_load_assets_spent() -> int:
+    """Net points players have spent on assets (purchases + rerolls - sale refunds),
+    from the `house` table. It is subtracted from the house balance so asset
+    spending doesn't count as house income. Needs the `assets_spent` column."""
+    try:
+        res = requests.get(f"{SUPABASE_URL}/rest/v1/house?id=eq.1&select=assets_spent",
+                           headers=get_supabase_headers(), timeout=10)
+        if res.status_code == 200:
+            rows = res.json()
+            return int(rows[0].get("assets_spent") or 0) if rows else 0
+        print(f"[Supabase] Failed to load house.assets_spent ({res.status_code}). "
+              f"Did you add the assets_spent column to the house table? {res.text}")
+    except Exception as e:
+        print(f"[Supabase] db_load_assets_spent error: {e}")
+    return 0
 
 def db_load_assets() -> dict | None:
     try:
@@ -4244,7 +4270,7 @@ async def _pay_dividends(boundary: datetime) -> tuple[dict, list]:
     paid, bans = {}, []
     for h in list(HOLDINGS):
         a = ASSETS.get(h["asset_id"])
-        if a is None:
+        if a is None or h["sid"] not in TRACKED_PLAYERS:    # asset removed / player no longer tracked
             continue
         owed = (boundary - h["last_paid_at"]).total_seconds() / 86400
         if owed <= 0:
@@ -4345,7 +4371,7 @@ def compute_asset_bonuses(player_stats: dict, total_matches: int, now: datetime 
     out = {}
     for h in HOLDINGS:
         a = ASSETS.get(h["asset_id"])
-        if not a or not asset_bonus_parts(a):
+        if not a or h["sid"] not in TRACKED_PLAYERS or not asset_bonus_parts(a):
             continue
         s = player_stats.get(TRACKED_PLAYERS.get(h["sid"], ""), {})
         raw = (a["kill_pct"] * s.get("kills", 0) * POINTS_PER_KILL
@@ -4481,12 +4507,12 @@ async def buy_command(ctx, *, choice: str = None):
         if a["price"] != price:
             await ctx.send("❌ The price changed while you were confirming. Try again.")
             return
-        if await adjust_balance(sid, -price) is None:
+        if await adjust_balance(sid, -price, asset_spend=True) is None:
             await ctx.send("❌ Not enough balance.")
             return
         row = await asyncio.to_thread(db_insert_holding, sid, a["id"], price, datetime.now(timezone.utc))
         if row is None:
-            await adjust_balance(sid, price)    # refund
+            await adjust_balance(sid, price, asset_spend=True)    # refund
             await ctx.send("❌ Couldn't save your purchase — you were not charged. Try again.")
             return
         HOLDINGS.append(row)
@@ -4536,7 +4562,7 @@ async def sell_command(ctx, *, choice: str = None):
             await ctx.send("❌ Couldn't save the sale. Try again.")
             return
         HOLDINGS[:] = [x for x in HOLDINGS if x["id"] != h["id"]]
-        new_bal = await adjust_balance(sid, refund)
+        new_bal = await adjust_balance(sid, refund, asset_spend=True)
     await ctx.send(f"💸 Sold {name} for **{refund:,}** points. Balance: **{new_bal:,}**.")
 
 @bot.command(name="portfolio", aliases=["pf", "inventory"])
@@ -4625,7 +4651,7 @@ async def reroll_command(ctx):
         if not any(_rollable(s) for s in SHOP_SLOTS):
             await ctx.send("❌ There's nothing to roll right now.")
             return
-        if await adjust_balance(sid, -ASSET_REROLL_COST) is None:
+        if await adjust_balance(sid, -ASSET_REROLL_COST, asset_spend=True) is None:
             await ctx.send(f"❌ A reroll costs **{ASSET_REROLL_COST}** points — "
                            f"you have {PLAYER_BALANCE.get(sid, 0):,}.")
             return
@@ -4712,7 +4738,7 @@ Buy CS-themed businesses that pay you points every day. You can hold **2 assets*
 • Every day at **22:00** (Belgian time) the shop restocks and all dividends are paid. Stock is limited (**1 per offer**), first come first served.
 • **Regular** assets pay a fixed daily dividend, forever. Selling gives back about half of what you paid, and you lose the income since the last payout.
 • 🔴 **Shady** assets pay much more, but every day there's a % chance they get **banned** (shown on the card). A banned asset is gone, and shady assets can't be sold.
-• 🎁 **Bonus** assets also pay extra at the Sunday payout, based on your week: % of your kill points, per top frag, per bottom frag, per game you play, or per game the whole server plays. Bonuses have a weekly cap and are pro-rated for the days you owned the asset that week.
+• 🎁 **Bonus** assets also pay extra at the Sunday payout, based on your week: % of your kill points, per top frag, per bottom frag, per game you play, or per game the whole server plays. Bonuses have no cap, but are pro-rated for the days you owned the asset that week.
 • 🏆 **Esports orgs** are priced by their current ranking: a better rank means a higher price and daily payout. When the ranking changes, the payout of everyone who owns an org changes with it.
 • Every asset pays something daily, so bonuses are a top-up.
 
@@ -4749,10 +4775,11 @@ async def help_command(ctx):
 
 @bot.event
 async def on_ready():
-    global TRACKED_PLAYERS, PLAYER_DISCORD_IDS, PLAYER_RANK_BRACKET, PLAYER_BALANCE, HOUSE_TOTAL_PAID_OUT
+    global TRACKED_PLAYERS, PLAYER_DISCORD_IDS, PLAYER_RANK_BRACKET, PLAYER_BALANCE, HOUSE_TOTAL_PAID_OUT, HOUSE_ASSETS_SPENT
     print(f"✅ Logged in as {bot.user}")
     TRACKED_PLAYERS, PLAYER_DISCORD_IDS, PLAYER_RANK_BRACKET, PLAYER_BALANCE = await asyncio.to_thread(db_load_tracked)
     HOUSE_TOTAL_PAID_OUT = await asyncio.to_thread(db_load_house)
+    HOUSE_ASSETS_SPENT = await asyncio.to_thread(db_load_assets_spent)
     async with BALANCE_LOCK:
         await sync_house_balance()
     print(f"📋 Loaded {len(TRACKED_PLAYERS)} tracked player(s) from Supabase "
