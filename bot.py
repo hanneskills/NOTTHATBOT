@@ -1687,6 +1687,7 @@ async def weekly_recap_task():
     if not (now.hour == 22 and now.minute == 0):
         return
 
+    paid_payout_embed = None        # points are paid once; other servers just show the same embed
     for guild in bot.guilds:
         leetify_channel = discord.utils.get(guild.text_channels, name=LEETIFY_CHANNEL_NAME)
         weekly_channel  = discord.utils.get(guild.text_channels, name=WEEKLY_CHANNEL_NAME)
@@ -1701,10 +1702,13 @@ async def weekly_recap_task():
             if embeds:
                 # Pay out this week's points and add a payout embed to the recap.
                 payouts = compute_weekly_payouts(stats, total_matches=meta.get("matches", 0))
-                if payouts:
+                if paid_payout_embed is not None:
+                    embeds.append(paid_payout_embed)
+                elif payouts:
                     for sid, p in payouts.items():
                         await adjust_balance(sid, p["total"], paid_out=True)
-                    embeds.append(build_payout_embed(payouts))
+                    paid_payout_embed = build_payout_embed(payouts)
+                    embeds.append(paid_payout_embed)
                 for i, e in enumerate(embeds):
                     try:
                         await weekly_channel.send(embed=e)
@@ -4234,6 +4238,10 @@ def _shop_needs_roll(boundary: datetime) -> bool:
         return True
     return min(e["rolled_at"] for e in SHOP.values()) < boundary
 
+def _roll_time_tag() -> str:
+    """Discord timestamp of the next daily roll: every viewer sees their own local time."""
+    return f"<t:{int(_next_roll_boundary(datetime.now(timezone.utc)).timestamp())}:t>"
+
 def _dividends_due(boundary: datetime) -> bool:
     return any((boundary - h["last_paid_at"]).total_seconds() > 0 for h in HOLDINGS)
 
@@ -4241,7 +4249,7 @@ def build_shop_embed(title: str = "🛒 Asset Shop") -> discord.Embed:
     nxt = _next_roll_boundary(datetime.now(timezone.utc))
     embed = discord.Embed(
         title=title,
-        description=(f"Restocks <t:{int(nxt.timestamp())}:R> (daily at {ASSET_ROLL_HOUR}:00). "
+        description=(f"Restocks <t:{int(nxt.timestamp())}:R> (daily at {_roll_time_tag()}, your local time). "
                      f"`!buy <1-4>` to buy · `!reroll` ({ASSET_REROLL_COST} pts) for a new shop · "
                      f"`!help` explains everything"),
         color=discord.Color.gold())
@@ -4436,7 +4444,7 @@ def _check_buy(sid: str, slot: str) -> tuple[dict | None, str | None]:
     if not a:
         return None, "❌ Nothing is on offer in that slot right now."
     if entry["stock_left"] <= 0:
-        return None, f"❌ **{a['name']}** is sold out — new stock arrives at {ASSET_ROLL_HOUR}:00, or `!reroll`."
+        return None, f"❌ **{a['name']}** is sold out — new stock arrives at {_roll_time_tag()}, or `!reroll`."
     owned = _holdings_of(sid)
     if len(owned) >= MAX_ASSET_SLOTS:
         return None, (f"❌ You already hold {MAX_ASSET_SLOTS} assets. `!sell` one first "
@@ -4522,7 +4530,7 @@ async def buy_command(ctx, *, choice: str = None):
             print("[assets] Supabase write failed for shop stock.")
     embed = discord.Embed(
         title=f"✅ Bought {a['emoji']} {a['name']}",
-        description=(f"{asset_details(a)}\n\nFirst payout at the next {ASSET_ROLL_HOUR}:00 "
+        description=(f"{asset_details(a)}\n\nFirst payout at the next daily payout ({_roll_time_tag()}) "
                      f"(pro-rated for today). Balance: **{PLAYER_BALANCE.get(sid, 0):,}**."),
         color=discord.Color.green())
     await ctx.send(embed=embed)
@@ -4597,8 +4605,9 @@ async def portfolio_command(ctx, member: discord.Member = None):
                    f"owned since <t:{int(h['bought_at'].timestamp())}:R>"),
             inline=False)
     nxt = _next_roll_boundary(datetime.now(timezone.utc))
+    embed.description = f"Next payout <t:{int(nxt.timestamp())}:t> (<t:{int(nxt.timestamp())}:R>)"
     embed.set_footer(text=f"Slots {len(owned)}/{MAX_ASSET_SLOTS} · base income {total_daily:,}/day "
-                          f"(~{total_daily * 7:,}/week) · next payout {nxt.astimezone(ASSET_TZ):%H:%M}")
+                          f"(~{total_daily * 7:,}/week)")
     await ctx.send(embed=embed)
 
 @bot.command(name="catalog", aliases=["catalogue", "items"])
@@ -4735,7 +4744,7 @@ Buy CS-themed businesses that pay you points every day. You can hold **2 assets*
 `!reroll` — pay 50 points to replace the whole shop right now
 
 ⏰ **How it works**
-• Every day at **22:00** (Belgian time) the shop restocks and all dividends are paid. Stock is limited (**1 per offer**), first come first served.
+• Every day at {roll_time} (shown in your local time) the shop restocks and all dividends are paid. Stock is limited (**1 per offer**), first come first served.
 • **Regular** assets pay a fixed daily dividend, forever. Selling gives back about half of what you paid, and you lose the income since the last payout.
 • 🔴 **Shady** assets pay much more, but every day there's a % chance they get **banned** (shown on the card). A banned asset is gone, and shady assets can't be sold.
 • 🎁 **Bonus** assets also pay extra at the Sunday payout, based on your week: % of your kill points, per top frag, per bottom frag, per game you play, or per game the whole server plays. Bonuses have no cap, but are pro-rated for the days you owned the asset that week.
@@ -4757,6 +4766,7 @@ async def help_command(ctx):
     text = HELP_BY_CHANNEL.get(getattr(ctx.channel, "name", ""))
     if text is None:
         text = "Use `!help` in #gambling-commands, #assets, #leetify or #bot-channel."
+    text = text.replace("{roll_time}", _roll_time_tag())
     # Discord messages are limited to 2000 characters: split on line breaks if needed.
     chunks, current = [], ""
     for line in text.split("\n"):
