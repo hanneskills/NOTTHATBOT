@@ -3904,6 +3904,7 @@ HOLDINGS: list = []     # active holdings: {id, sid, asset_id, price_paid, bough
 SHOP: dict = {}         # slot -> {"asset_id", "stock_left", "rolled_at"}
 SHOP_LOCK = asyncio.Lock()
 _ASSET_TICKS = 0
+ASSET_DATA_LOADED = False   # True once catalogue, holdings and shop were all read
 
 # ── Time helpers ────────────────────────────────────────────────────
 
@@ -4146,15 +4147,19 @@ async def _check_rank_changes():
     await _announce_in_assets([build_rank_embed(prev, "📊 Org rankings updated")])
 
 async def load_asset_data():
-    """Loads catalogue, holdings and shop state at startup."""
-    global HOLDINGS, SHOP
-    await reload_assets_catalog()
-    holdings = await asyncio.to_thread(db_load_holdings)
-    if holdings is not None:
-        HOLDINGS = holdings
-    shop = await asyncio.to_thread(db_load_shop)
-    if shop is not None:
-        SHOP = shop
+    """Loads catalogue, holdings and shop state at startup (retried by
+    asset_daily_task until everything has loaded)."""
+    global HOLDINGS, SHOP, ASSET_DATA_LOADED
+    async with SHOP_LOCK:
+        catalog_ok = await reload_assets_catalog()
+        holdings = await asyncio.to_thread(db_load_holdings)
+        if holdings is not None:
+            HOLDINGS = holdings
+        shop = await asyncio.to_thread(db_load_shop)
+        if shop is not None:
+            SHOP = shop
+        if catalog_ok and holdings is not None and shop is not None:
+            ASSET_DATA_LOADED = True
     print(f"🏢 Assets: {len(ASSETS)} catalogue item(s), {len(HOLDINGS)} active holding(s), "
           f"{len(SHOP)} shop slot(s).")
 
@@ -4370,6 +4375,10 @@ async def asset_daily_task():
     Belgian time (also catches up after a restart or downtime)."""
     global _ASSET_TICKS
     try:
+        if not ASSET_DATA_LOADED:
+            await load_asset_data()
+            if not ASSET_DATA_LOADED:
+                return                  # never pay or restock on partial data
         _ASSET_TICKS += 1
         if _ASSET_TICKS % ASSET_CATALOG_RELOAD_EVERY == 0:
             await reload_assets_catalog()
@@ -4418,6 +4427,9 @@ async def _assets_ctx(ctx, need_player: bool = True) -> str | None | bool:
     if getattr(ctx.channel, "name", "") != ASSETS_CHANNEL_NAME:
         ch = discord.utils.get(ctx.guild.text_channels, name=ASSETS_CHANNEL_NAME) if ctx.guild else None
         await ctx.send(f"❌ Asset commands only work in {ch.mention if ch else '#' + ASSETS_CHANNEL_NAME}.")
+        return None
+    if not ASSET_DATA_LOADED:
+        await ctx.send("⏳ Assets are still loading. Try again in a minute.")
         return None
     if not need_player:
         return True
@@ -4807,20 +4819,21 @@ async def on_ready():
     print(f"📋 Loaded {len(TRACKED_PLAYERS)} tracked player(s) from Supabase "
           f"({len(PLAYER_DISCORD_IDS)} linked to Discord).")
 
+    # Assets load before the catch-up below, which can take several minutes.
+    await load_asset_data()
+    if not asset_daily_task.is_running():
+        asset_daily_task.start()
+
     # Catch up on any matches (including Faceit games) that happened while the
     # bot was offline, and re-sync rank roles, before starting the regular
     # periodic checker. (Same flow the nightly midnight_catchup_task runs.)
     for guild in bot.guilds:
         await run_automatic_catchup(guild)
 
-    await load_asset_data()
-
     check_leetify_stats.start()
     reset_poll_at_3am.start()
     weekly_recap_task.start()
     midnight_catchup_task.start()
-    if not asset_daily_task.is_running():
-        asset_daily_task.start()
 
 # =================================================================
 # 12. RUN
