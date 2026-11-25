@@ -3882,6 +3882,10 @@ ASSET_REROLL_COST      = 50
 ASSET_ROLL_HOUR        = 22         # dividends + shop restock, in ASSET_TZ
 ASSET_CONFIRM_TIMEOUT  = 30
 ASSET_CATALOG_RELOAD_EVERY = 10     # minutes between automatic catalogue reloads
+# Hidden safety net (deliberately not mentioned in any player-facing text):
+# no ban roll until a holding's dividends have returned this share of its price.
+BAN_SAFE_PAYBACK       = 0.5
+BAN_SAFE_SLACK_DAYS    = 0.1        # covers DST / rounding, errs in the player's favour
 SHOP_SLOTS = ["cheap", "mid", "high", "shady"]
 SLOT_LABEL = {
     "cheap": "🟢 Cheap",
@@ -4269,6 +4273,12 @@ def build_shop_embed(title: str = "🛒 Asset Shop") -> discord.Embed:
 
 # ── Daily tick: dividends, bans, restock ────────────────────────────
 
+def _dividends_received(h: dict, a: dict) -> float:
+    """Daily dividends this holding has already paid out, derived from how long it
+    had been paid for (slightly under-estimated on purpose)."""
+    days = (h["last_paid_at"] - h["bought_at"]).total_seconds() / 86400
+    return a["daily"] * max(0.0, days - BAN_SAFE_SLACK_DAYS)
+
 async def _pay_dividends(boundary: datetime) -> tuple[dict, list]:
     """Pays every holding for the time since it was last paid (a full day per
     24h; the first, partial day is pro-rated) and rolls the ban chance of shady
@@ -4286,10 +4296,12 @@ async def _pay_dividends(boundary: datetime) -> tuple[dict, list]:
         if abs(owed - round(owed)) < 0.05:      # absorb DST hour / small drift
             owed = float(round(owed))
         pay, remaining, banned = 0.0, owed, False
+        received = _dividends_received(h, a)
         while remaining > 1e-9:
             step = min(1.0, remaining)
             pay += a["daily"] * step                             # pay the day first,
-            if a["ban_chance"] > 0 and random.random() < 1 - (1 - a["ban_chance"]) ** step:
+            at_risk = received + pay >= h["price_paid"] * BAN_SAFE_PAYBACK
+            if at_risk and a["ban_chance"] > 0 and random.random() < 1 - (1 - a["ban_chance"]) ** step:
                 banned = True                                    # then roll the ban
                 break
             remaining -= step
